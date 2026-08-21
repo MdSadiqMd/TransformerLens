@@ -17,13 +17,16 @@ Covered:
 - Architecture guards.
 """
 
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch.nn as nn
 from torch import ones, randn, zeros
 
+from tests.unit.model_bridge.supported_architectures.helpers import (
+    fake_hf_model,
+    fake_hf_model_with_eager_targets,
+)
 from transformer_lens.config import TransformerBridgeConfig
 from transformer_lens.model_bridge.generalized_components import (
     BlockBridge,
@@ -85,25 +88,6 @@ def _conversions(adapter: Olmo2ArchitectureAdapter) -> dict:
     conversions = adapter.weight_processing_conversions
     assert conversions is not None
     return conversions
-
-
-def _fake_hf_model(rotary_emb: object) -> SimpleNamespace:
-    """Minimal HF model exposing only model.rotary_emb (no config, no layers)."""
-    return SimpleNamespace(model=SimpleNamespace(rotary_emb=rotary_emb))
-
-
-def _fake_hf_model_with_eager_targets(rotary_emb: object) -> SimpleNamespace:
-    """HF model whose top-level and per-layer attention implementation start non-eager."""
-    layers = [
-        SimpleNamespace(
-            self_attn=SimpleNamespace(config=SimpleNamespace(_attn_implementation="sdpa"))
-        )
-        for _ in range(2)
-    ]
-    return SimpleNamespace(
-        config=SimpleNamespace(_attn_implementation="sdpa"),
-        model=SimpleNamespace(rotary_emb=rotary_emb, layers=layers),
-    )
 
 
 class DummyAttention:
@@ -302,6 +286,20 @@ class TestOlmo2HookAliasOverrides:
         block = _mapping(adapter)["blocks"]
         assert block.hook_aliases["hook_resid_mid"] == "mlp.hook_in"
 
+    def test_contribution_aliases_point_at_post_norm_outputs(
+        self, adapter: Olmo2ArchitectureAdapter
+    ) -> None:
+        """hook_attn_out / hook_mlp_out must expose the tensor added to the
+        residual stream, which under post-norm is the norm output (#1648)."""
+        block = _mapping(adapter)["blocks"]
+        assert block.hook_aliases["hook_attn_out"] == "ln1.hook_out"
+        assert block.hook_aliases["hook_mlp_out"] == "ln2.hook_out"
+
+    def test_hook_mlp_in_captures_on_mlp(self, adapter: Olmo2ArchitectureAdapter) -> None:
+        """No pre-MLP norm exists, so the hook_mlp_in capture sits on the MLP."""
+        block = _mapping(adapter)["blocks"]
+        assert block.mlp_reads_resid_directly is True
+
 
 class TestOlmo2GQAHookShapes:
     """Wire a fake attention module into the bridge and verify GQA hook shapes.
@@ -388,7 +386,7 @@ class TestOlmo2SetupComponentTesting:
         attn_template = adapter.get_generalized_component("blocks.0.attn")
         assert isinstance(attn_template, PositionEmbeddingsAttentionBridge)
 
-        adapter.setup_component_testing(_fake_hf_model(rotary_emb))
+        adapter.setup_component_testing(fake_hf_model(rotary_emb))
 
         assert attn_template._rotary_emb is rotary_emb
 
@@ -398,7 +396,7 @@ class TestOlmo2SetupComponentTesting:
         rotary_emb = object()
         bridge_model = DummyBridgeModel([DummyBlock(), DummyBlock(), DummyBlock()])
 
-        adapter.setup_component_testing(_fake_hf_model(rotary_emb), bridge_model=bridge_model)
+        adapter.setup_component_testing(fake_hf_model(rotary_emb), bridge_model=bridge_model)
 
         for block in bridge_model.blocks:
             assert block.attn.rotary_emb is rotary_emb
@@ -407,14 +405,14 @@ class TestOlmo2SetupComponentTesting:
         rotary_emb = object()
         bridge_model = DummyBridgeModel([DummyBlock(), DummyBlock(has_attention=False)])
 
-        adapter.setup_component_testing(_fake_hf_model(rotary_emb), bridge_model=bridge_model)
+        adapter.setup_component_testing(fake_hf_model(rotary_emb), bridge_model=bridge_model)
 
         assert bridge_model.blocks[0].attn.rotary_emb is rotary_emb
 
     def test_forces_eager_attention_implementation(self, adapter: Olmo2ArchitectureAdapter) -> None:
         """Bridge attention only matches HF under eager attention, so it is forced on
         at both the top-level config and on each per-layer self_attn.config."""
-        hf_model = _fake_hf_model_with_eager_targets(object())
+        hf_model = fake_hf_model_with_eager_targets(object())
 
         adapter.setup_component_testing(hf_model)
 
@@ -427,8 +425,8 @@ class TestOlmo2SetupComponentTesting:
     ) -> None:
         """The defensive hasattr branches must not raise when config/layers are absent."""
         rotary_emb = object()
-        # _fake_hf_model exposes only model.rotary_emb (no config, no layers).
-        adapter.setup_component_testing(_fake_hf_model(rotary_emb))
+        # fake_hf_model exposes only model.rotary_emb (no config, no layers).
+        adapter.setup_component_testing(fake_hf_model(rotary_emb))
 
         attn_template = adapter.get_generalized_component("blocks.0.attn")
         assert isinstance(attn_template, PositionEmbeddingsAttentionBridge)

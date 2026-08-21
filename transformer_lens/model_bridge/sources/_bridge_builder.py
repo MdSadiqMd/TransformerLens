@@ -13,6 +13,11 @@ from transformer_lens.factories.architecture_adapter_factory import (
 )
 from transformer_lens.model_bridge.architecture_adapter import ArchitectureAdapter
 from transformer_lens.model_bridge.bridge import TransformerBridge
+from transformer_lens.utilities.heterogeneous_config import (
+    het_safe_view,
+    per_layer_attr_names,
+    safe_config_get,
+)
 
 # Architecture-agnostic; do not extend per-architecture.
 _HF_PASSTHROUGH_ATTRS = [
@@ -34,12 +39,15 @@ _HF_PASSTHROUGH_ATTRS = [
     # Granite
     "position_embedding_type",
     "logits_scaling",
+    "residual_multiplier",
     # Falcon
     "parallel_attn",
     "multi_query",
     "new_decoder_architecture",
     "alibi",
     "num_ln_in_parallel_attn",
+    # GPTNeoX
+    "use_parallel_residual",
     # Mamba (SSM config)
     "state_size",
     "conv_kernel",
@@ -180,14 +188,21 @@ def build_bridge_config_from_hf(
     bridge_config.dtype = dtype
 
     effective_config = get_effective_text_config(hf_config)
+    # Per-layer-registered attrs would raise on global access (transformers>=5.15).
+    _het_attrs = per_layer_attr_names(effective_config) | per_layer_attr_names(hf_config)
     for attr in _HF_PASSTHROUGH_ATTRS:
+        if attr in _het_attrs:
+            continue
         val = getattr(effective_config, attr, None)
         if val is None and effective_config is not hf_config:
             val = getattr(hf_config, attr, None)
         if val is not None:
             setattr(bridge_config, attr, val)
 
-    # Gemma2: HF softcap field names differ from TL's.
+    # Gemma2: HF softcap field names differ from TL's. Read through the het
+    # view: a per-layer-registered field raises (not AttributeError) on raw
+    # getattr, so the default would not save us.
+    effective_config = het_safe_view(effective_config)
     final_logit_softcapping = getattr(effective_config, "final_logit_softcapping", None)
     if final_logit_softcapping is not None:
         bridge_config.output_logits_soft_cap = float(final_logit_softcapping)
@@ -201,9 +216,13 @@ def build_bridge_config_from_hf(
     # Nested encoder sub-configs (T5Gemma family): n_heads/n_key_value_heads are
     # decoder-effective, so expose encoder head counts for per-side conversions.
     # T5Gemma2 nests them one level deeper (encoder.text_config).
-    encoder_subconfig = getattr(hf_config, "encoder", None)
+    encoder_subconfig = safe_config_get(hf_config, "encoder")
+    if encoder_subconfig is not None:
+        encoder_subconfig = het_safe_view(encoder_subconfig)
     if encoder_subconfig is not None and not hasattr(encoder_subconfig, "num_attention_heads"):
-        encoder_subconfig = getattr(encoder_subconfig, "text_config", None)
+        encoder_subconfig = safe_config_get(encoder_subconfig, "text_config")
+        if encoder_subconfig is not None:
+            encoder_subconfig = het_safe_view(encoder_subconfig)
     if encoder_subconfig is not None:
         enc_heads = getattr(encoder_subconfig, "num_attention_heads", None)
         if enc_heads is not None:

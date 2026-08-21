@@ -16,6 +16,7 @@ from typing import (
     Any,
     Callable,
     Dict,
+    FrozenSet,
     Iterator,
     List,
     Literal,
@@ -43,6 +44,7 @@ from transformer_lens.model_bridge.composition_scores import CompositionScores
 from transformer_lens.model_bridge.exceptions import StopAtLayerException
 from transformer_lens.model_bridge.generalized_components.base import (
     GeneralizedComponent,
+    alias_generation,
 )
 from transformer_lens.model_bridge.generalized_components.block import (
     _BLOCK_INTERNAL_MODULES,
@@ -55,11 +57,16 @@ from transformer_lens.utilities.activation_functions import softcap_enabled
 from transformer_lens.utilities.aliases import resolve_alias
 from transformer_lens.utilities.devices import move_to_and_update_config
 from transformer_lens.utilities.lm_utils import lm_cross_entropy_loss
+from transformer_lens.utilities.quantization import require_readable_weight
+from transformer_lens.utilities.slice import Slice, SliceInput
 
 if TYPE_CHECKING:
     from transformer_lens.ActivationCache import ActivationCache
 
 _BLOCK_PATTERN = re.compile("blocks\\.(\\d+)")
+
+# Block-list container attributes a bridge may expose.
+_BLOCK_LIST_ATTRS = ("blocks", "encoder_blocks", "decoder_blocks", "L_blocks", "H_blocks")
 
 
 def _resolve_attr_path(obj: nn.Module, attr_path: str) -> torch.Tensor:
@@ -96,6 +103,23 @@ def build_alias_to_canonical_map(hook_dict, prefix=""):
             if key != value.name:
                 aliases[full_key] = value.name
     return aliases
+
+
+def _pos_axis_for_hook(hook_name: str, hook_point: HookPoint) -> int:
+    """Return the axis `pos_slice` applies to for a hook's cached activation.
+
+    Head-split tensors are [batch, pos, head, d_head], so their position axis is two from the
+    end; everything else (residual stream, MLP, attention patterns keyed by destination
+    position) has it one from the end. HookedTransformer-style names are recognised by
+    suffix, bridge-native ones (`attn.q.hook_out`, `attn.o.hook_in`, ...) by the head-splitting
+    conversion installed on their hook point.
+    """
+    if hook_name.endswith(("hook_q", "hook_k", "hook_v", "hook_z", "hook_result")):
+        return -3
+    conversion = getattr(hook_point, "hook_conversion", None)
+    if getattr(conversion, "splits_attention_heads", False):
+        return -3
+    return -2
 
 
 class TransformerBridge(HookIntrospectionMixin, nn.Module):
@@ -185,9 +209,13 @@ class TransformerBridge(HookIntrospectionMixin, nn.Module):
         self.compatibility_mode = False
         self._weights_processed = False
         self._hook_cache = None
+        # Nesting depth of hook-adding contexts; hooks are tagged with it so teardown removes
+        # only the ones this call/context added, leaving the caller's own hooks in place.
+        self.context_level = 0
         self._hook_registry: Dict[str, HookPoint] = {}
         self._hook_registry_initialized = False
         self._hook_alias_registry: Dict[str, Union[str, List[str]]] = {}
+        self._block_alias_cache: Optional[Tuple[Tuple[int, int], Dict[str, str]]] = None
         self._property_alias_registry: Dict[str, str] = {}
         # real_components maps TL keys to (remote_path, actual_instance) tuples
         # For list components, actual_instance will be a list of component instances
@@ -440,7 +468,7 @@ class TransformerBridge(HookIntrospectionMixin, nn.Module):
         d_head = self.cfg.d_head
         d_model = self.cfg.d_model
         blocks_iter = []
-        for bl_name in ("blocks", "encoder_blocks", "decoder_blocks", "L_blocks", "H_blocks"):
+        for bl_name in _BLOCK_LIST_ATTRS:
             if hasattr(self, bl_name):
                 blocks_iter.append(getattr(self, bl_name))
         if not blocks_iter:
@@ -520,23 +548,38 @@ class TransformerBridge(HookIntrospectionMixin, nn.Module):
         self._scan_existing_hooks(self, "")
         self._hook_registry_initialized = True
 
-    def _collect_component_aliases(self, component_mapping, prefix=""):
-        """Recursively collect aliases from components."""
-        aliases = {}
+    def _collect_component_aliases(self, component_mapping, prefix="", _ancestors=frozenset()):
+        """Recursively collect aliases from the architecture's component templates.
+
+        ``_ancestors`` is path-scoped, not globally-visited: a cycle is cut
+        (else RecursionError at boot) while a diamond-shared component still
+        contributes aliases under both names.
+        """
+        aliases: Dict[str, str] = {}
+        if id(component_mapping) in _ancestors:
+            return aliases
+        _ancestors = _ancestors | {id(component_mapping)}
         if isinstance(component_mapping, dict):
             for name, component in component_mapping.items():
                 sub_prefix = f"{prefix}.{name}" if prefix else name
-                aliases.update(self._collect_component_aliases(component, sub_prefix))
+                aliases.update(self._collect_component_aliases(component, sub_prefix, _ancestors))
         else:
             if hasattr(component_mapping, "hook_aliases") and component_mapping.hook_aliases:
                 for alias_name, target in component_mapping.hook_aliases.items():
+                    # Skip fallback-list targets: the lru_cached consumer
+                    # endswith-matches strings, so a list is neither matchable
+                    # nor hashable; lists resolve via the instance walks instead.
+                    if not isinstance(target, str):
+                        continue
                     full_alias = f"{prefix}.{alias_name}" if prefix else alias_name
                     full_target = f"{prefix}.{target}" if prefix else target
                     aliases[full_alias] = full_target
             if hasattr(component_mapping, "submodules") and component_mapping.submodules:
                 for sub_name, sub_component in component_mapping.submodules.items():
                     sub_prefix = f"{prefix}.{sub_name}" if prefix else sub_name
-                    aliases.update(self._collect_component_aliases(sub_component, sub_prefix))
+                    aliases.update(
+                        self._collect_component_aliases(sub_component, sub_prefix, _ancestors)
+                    )
         return aliases
 
     @staticmethod
@@ -578,8 +621,75 @@ class TransformerBridge(HookIntrospectionMixin, nn.Module):
             aliases_tuple = self._compute_hook_aliases_cached(
                 hook_names_tuple, component_aliases_tuple
             )
-            return dict(aliases_tuple)
+            aliases = dict(aliases_tuple)
+            aliases.update(self._collect_block_instance_aliases())
+            return aliases
         return {}
+
+    def _collect_block_instance_aliases(self) -> Dict[str, str]:
+        """Collect per-block-instance aliases, overriding template-derived ones.
+
+        Templates cannot see per-layer rebinds (OlmoHybrid, MoE dense/sparse).
+        Memoized on (registry size, alias generation): size alone misses a
+        dense<->sparse rebind, which changes targets without changing size.
+        """
+        cache_key = (len(self._hook_registry), alias_generation())
+        cached = self._block_alias_cache
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
+        aliases: Dict[str, str] = {}
+        unresolved: List[str] = []
+        for bl_name in _BLOCK_LIST_ATTRS:
+            block_list = getattr(self, bl_name, None)
+            if block_list is None:
+                continue
+            for i, block in enumerate(block_list):
+                # A block with no registered hooks means the registry hasn't
+                # scanned it yet — unresolved aliases there are timing, not drops.
+                block_prefix = f"{bl_name}.{i}."
+                if f"{block_prefix}hook_in" not in self._hook_registry:
+                    continue
+                # Walk the block and its submodule tree: components rebind
+                # aliases per layer at bind time either at block level
+                # (OlmoHybrid) or one level down (MoEBridge's dense/sparse
+                # dispatch). id()-seen guards against shared/cyclic submodule
+                # references, which would otherwise hang boot.
+                # (prefix, component, ids-on-this-path): path-scoped rather than
+                # globally-visited so a cycle is cut while a component shared
+                # under two names still contributes aliases at both.
+                stack: List[Tuple[str, Any, FrozenSet[int]]] = [("", block, frozenset())]
+                while stack:
+                    sub_prefix, component, ancestors = stack.pop()
+                    if id(component) in ancestors:
+                        continue
+                    ancestors = ancestors | {id(component)}
+                    component_aliases = getattr(component, "hook_aliases", None)
+                    if component_aliases:
+                        for alias_name, target in component_aliases.items():
+                            targets = target if isinstance(target, list) else [target]
+                            for single_target in targets:
+                                full_target = f"{block_prefix}{sub_prefix}{single_target}"
+                                if full_target in self._hook_registry:
+                                    aliases[f"{block_prefix}{sub_prefix}{alias_name}"] = full_target
+                                    break
+                            else:
+                                unresolved.append(f"{block_prefix}{sub_prefix}{alias_name}")
+                    for nested_name, nested in (
+                        getattr(component, "submodules", None) or {}
+                    ).items():
+                        stack.append((f"{sub_prefix}{nested_name}.", nested, ancestors))
+        if unresolved:
+            # Surface drops instead of silently swallowing, mirroring
+            # GeneralizedComponent._register_aliases.
+            warnings.warn(
+                f"{len(unresolved)} block hook alias(es) did not resolve to a "
+                f"registered hook (e.g. '{unresolved[0]}'). Any such alias falls "
+                "back to the architecture template's mapping, which for a "
+                "per-layer rebind is the wrong tensor for this layer.",
+                stacklevel=2,
+            )
+        self._block_alias_cache = (cache_key, aliases)
+        return aliases
 
     def _add_aliases_to_hooks(self, hooks: Dict[str, HookPoint]) -> None:
         """Add aliases to hooks in place."""
@@ -857,11 +967,11 @@ class TransformerBridge(HookIntrospectionMixin, nn.Module):
 
         apply_fn_to_all_components(self, set_compatibility_mode)
         self.clear_hook_registry()
-        # Drop pre-ln capture handles from any prior call so they don't accumulate.
+        # Drop block capture-hook handles from any prior call so they don't accumulate.
         if hasattr(self, "blocks"):
             for block in self.blocks:
-                if hasattr(block, "_teardown_pre_ln_capture"):
-                    block._teardown_pre_ln_capture()
+                if hasattr(block, "_teardown_capture_hooks"):
+                    block._teardown_capture_hooks()
         try:
             if not no_processing:
                 self.process_weights(
@@ -937,6 +1047,28 @@ class TransformerBridge(HookIntrospectionMixin, nn.Module):
             fold_value_biases: Fold value biases into output bias. Default: True
             refactor_factored_attn_matrices: Experimental QK/OV factorization. Default: False
         """
+        # Folding and centering do arithmetic on raw weights, so packed or
+        # scale-separated storage would produce silent garbage. The forward
+        # path stays usable when quantized; only this transformation does not.
+        for name, param in self.original_model.named_parameters():
+            # No name filter: modern batched-MoE experts are Parameters that do
+            # NOT end in .weight (mlp.experts.gate_up_proj), and those are the
+            # very tensors the converters had to guard. unreadable_weight_reason
+            # is dtype-driven, so every full-width float parameter still passes.
+            # Routed through the shared helper so meta gets its own "load with
+            # real weights" message instead of being silently skipped — folding
+            # on meta tensors yields meta tensors, which is the same
+            # silent-garbage failure this guard exists to stop.
+            require_readable_weight(
+                param,
+                operation=f"process weights ({name})",
+                owner=self.original_model,
+                remedy=(
+                    "Load the model dequantized, or use the bridge without weight "
+                    "processing (enable_compatibility_mode(no_processing=True))."
+                ),
+            )
+
         # A failed or partial processing attempt is no longer guaranteed to retain
         # the raw HuggingFace basis, so invalidate that contract before any work.
         self._weights_processed = True
@@ -1308,43 +1440,48 @@ class TransformerBridge(HookIntrospectionMixin, nn.Module):
     ) -> torch.Tensor:
         """Stack a parameter across all blocks; falls back to matching-only on hybrids.
 
-        On hybrid models, logs a warning about index mapping and returns only
-        blocks that have the submodule. First path segment is checked against
-        _modules; deeper segments resolve via getattr (intentional — W_Q etc.
-        are exposed via __getattr__ delegation).
+        Filters on FULL-path resolution, not the first segment: on interleaved
+        MoE, every block has `mlp` but only dense layers expose `mlp.W_in`, so
+        a first-segment filter matched everything and the sparse layer's
+        AttributeError killed the accessor for the whole model.
         """
         first_attr = attr_path.split(".")[0]
-        matching_blocks = [
-            (i, block) for i, block in enumerate(self.blocks) if first_attr in block._modules
-        ]
+        matching_blocks = []
+        for i, block in enumerate(self.blocks):
+            if first_attr not in block._modules:
+                continue
+            try:
+                weight = _resolve_attr_path(block, attr_path)
+            except AttributeError:
+                continue
+            matching_blocks.append((i, weight))
 
         if len(matching_blocks) == 0:
             raise AttributeError(
-                f"No blocks have submodule '{first_attr}'. "
+                f"No blocks resolve '{attr_path}'. "
                 f"Use bridge.blocks_with('{first_attr}') to check availability."
             )
 
         if len(matching_blocks) < len(self.blocks):
             indices = [i for i, _ in matching_blocks]
             logging.warning(
-                "Hybrid model: only %d/%d blocks have '%s'. Returning stacked tensor "
+                "Hybrid model: only %d/%d blocks resolve '%s'. Returning stacked tensor "
                 "for layers %s only. Tensor index i corresponds to original layer "
                 "indices[i], not layer i. For explicit index mapping, use "
                 "bridge.stack_params_for('%s', '%s').",
                 len(matching_blocks),
                 len(self.blocks),
-                first_attr,
+                attr_path,
                 indices,
                 first_attr,
                 attr_path,
             )
 
         weights: List[torch.Tensor] = []
-        for _, block in matching_blocks:
-            w = _resolve_attr_path(block, attr_path)
+        for _, weight in matching_blocks:
             if reshape_fn is not None:
-                w = reshape_fn(w)
-            weights.append(w)
+                weight = reshape_fn(weight)
+            weights.append(weight)
         # Under a device_map split, per-block tensors live on different devices.
         # torch.stack requires a common device; gather onto cfg.device (the embedding /
         # input device — a natural "home" for cross-layer reductions).
@@ -2127,6 +2264,12 @@ class TransformerBridge(HookIntrospectionMixin, nn.Module):
         input: Union[str, List[str], torch.Tensor],
         return_cache_object: Literal[True] = True,
         remove_batch_dim: bool = False,
+        names_filter: Optional[Union[str, List[str], Callable[[str], bool]]] = None,
+        stop_at_layer: Optional[int] = None,
+        incl_bwd: bool = False,
+        pos_slice: Optional[Union[Slice, SliceInput]] = None,
+        reset_hooks_end: bool = True,
+        clear_contexts: bool = False,
         **kwargs,
     ) -> Tuple[Any, ActivationCache]:
         """Run with cache - placeholder implementation."""
@@ -2138,6 +2281,12 @@ class TransformerBridge(HookIntrospectionMixin, nn.Module):
         input: Union[str, List[str], torch.Tensor],
         return_cache_object: Literal[False],
         remove_batch_dim: bool = False,
+        names_filter: Optional[Union[str, List[str], Callable[[str], bool]]] = None,
+        stop_at_layer: Optional[int] = None,
+        incl_bwd: bool = False,
+        pos_slice: Optional[Union[Slice, SliceInput]] = None,
+        reset_hooks_end: bool = True,
+        clear_contexts: bool = False,
         **kwargs,
     ) -> Tuple[Any, Dict[str, torch.Tensor]]:
         """Run with cache - placeholder implementation."""
@@ -2150,6 +2299,10 @@ class TransformerBridge(HookIntrospectionMixin, nn.Module):
         remove_batch_dim: bool = False,
         names_filter: Optional[Union[str, List[str], Callable[[str], bool]]] = None,
         stop_at_layer: Optional[int] = None,
+        incl_bwd: bool = False,
+        pos_slice: Optional[Union[Slice, SliceInput]] = None,
+        reset_hooks_end: bool = True,
+        clear_contexts: bool = False,
         **kwargs,
     ) -> Tuple[Any, Union[ActivationCache, Dict[str, torch.Tensor]]]:
         """Run the model and cache all activations.
@@ -2160,6 +2313,15 @@ class TransformerBridge(HookIntrospectionMixin, nn.Module):
                    remove_batch_dim: Whether to remove batch dimension
                    names_filter: Filter for which activations to cache (str, list of str, or callable)
                    stop_at_layer: Layer to stop forward pass at (uses StopAtLayerException; cleans up KV cache on stop)
+                   incl_bwd: If True, also caches gradients under a ``_grad`` suffix by calling
+                       ``backward()`` on the output, matching HookedRootModule.run_with_cache.
+                       Requires a scalar output, so pass ``return_type="loss"``.
+                   pos_slice: Slice applied to the position axis of every cached tensor
+                       (and of the gradients when ``incl_bwd``). Defaults to None, do nothing.
+                   reset_hooks_end: If True, removes the hooks this call added when it finishes.
+                       Hooks the caller added beforehand are left alone either way.
+                   clear_contexts: If True, clears the hook contexts of the touched hook points
+                       when the hooks are removed.
                    device: Where to store cached activations (matches ActivationCache.to;
                        does not move the model). Defaults to per-layer storage.
                    **kwargs: Additional arguments
@@ -2167,6 +2329,18 @@ class TransformerBridge(HookIntrospectionMixin, nn.Module):
                Returns:
                    Tuple of (output, cache)
         """
+        if incl_bwd and stop_at_layer is not None:
+            raise ValueError(
+                "incl_bwd=True cannot be combined with stop_at_layer: the run returns the "
+                "intermediate activation at that layer, not a scalar to call backward() on."
+            )
+        if incl_bwd and not torch.is_grad_enabled():
+            raise ValueError(
+                "incl_bwd=True needs autograd, but gradient tracking is off "
+                "(torch.no_grad(), set_grad_enabled(False) or inference mode). "
+                "Run the call with gradients enabled."
+            )
+
         aliases = build_alias_to_canonical_map(self.hook_dict)
 
         def create_names_filter_fn(filter_input):
@@ -2194,29 +2368,42 @@ class TransformerBridge(HookIntrospectionMixin, nn.Module):
         names_filter_fn = create_names_filter_fn(names_filter)
         cache: Dict[str, torch.Tensor] = {}
         hooks: List[Tuple[HookPoint, str]] = []
-        visited: set[int] = set()
 
         # None → no-op .to(None), tensors stay on their current device.
         cache_device = kwargs.pop("device", None)
+        resolved_pos_slice = Slice.unwrap(pos_slice)
 
-        def make_cache_hook(name: str):
-            def cache_hook(tensor: torch.Tensor, *, hook: Any) -> torch.Tensor:
+        def make_cache_hook(name: str, pos_dim: int = -2, is_backward: bool = False):
+            key = f"{name}_grad" if is_backward else name
+
+            def store(tensor: torch.Tensor) -> None:
+                tensor = tensor.detach().to(cache_device)
+                if pos_slice is not None and isinstance(tensor, torch.Tensor) and tensor.dim() >= 2:
+                    # Tensors too flat for the hook's layout (2D token ids at embed.hook_in)
+                    # still carry position on axis 1, right after batch. Deliberate divergence
+                    # from HookedRootModule, which would slice such a tensor on batch.
+                    axis = pos_dim if tensor.dim() >= 1 - pos_dim else 1
+                    tensor = resolved_pos_slice.apply(tensor, dim=axis)
+                cache[key] = tensor
+
+            def cache_hook(tensor: torch.Tensor, *, hook: Any) -> Optional[torch.Tensor]:
                 if tensor is None:
-                    cache[name] = None
+                    cache[key] = None
                 elif isinstance(tensor, torch.Tensor):
-                    cache[name] = tensor.detach().to(cache_device)
+                    store(tensor)
                 elif isinstance(tensor, tuple):
                     if len(tensor) > 0 and isinstance(tensor[0], torch.Tensor):
-                        cache[name] = tensor[0].detach().to(cache_device)
+                        store(tensor[0])
                     else:
                         pass
                 else:
                     try:
                         if hasattr(tensor, "detach"):
-                            cache[name] = tensor.detach().to(cache_device)
+                            store(tensor)
                     except Exception:
                         pass
-                return tensor
+                # A non-None return from a backward hook replaces grad_input; stay read-only.
+                return None if is_backward else tensor
 
             return cache_hook
 
@@ -2238,51 +2425,60 @@ class TransformerBridge(HookIntrospectionMixin, nn.Module):
                         except (IndexError, ValueError):
                             pass
                 hooks.append((hook, hook_name))
-        for hp, name in hooks:
-            hp.add_hook(make_cache_hook(name))
-        processed_args = [input]
-        if processed_args and isinstance(processed_args[0], str):
-            assert self.tokenizer is not None, "Tokenizer must be set to pass string input."
-            input_ids = self.to_tokens(processed_args[0])
-            input_ids = input_ids.to(next(self.original_model.parameters()).device)
-            kwargs["input_ids"] = input_ids
-            processed_args = processed_args[1:]
-        elif "input" in kwargs and isinstance(kwargs["input"], str):
-            assert self.tokenizer is not None, "Tokenizer must be set to pass string input."
-            input_ids = self.to_tokens(kwargs["input"])
-            input_ids = input_ids.to(next(self.original_model.parameters()).device)
-            kwargs["input_ids"] = input_ids
-            del kwargs["input"]
-        if stop_at_layer is not None and hasattr(self, "blocks"):
-            if stop_at_layer < 0:
-                stop_at_layer = len(self.blocks) + stop_at_layer
-            last_layer_to_process = stop_at_layer - 1
-
-            def stop_hook(tensor: torch.Tensor, *, hook: Any) -> torch.Tensor:
-                raise StopAtLayerException(tensor)
-
-            if stop_at_layer >= 0 and stop_at_layer < len(self.blocks):
-                # Stop at the beginning of the specified block, not at the end of the previous block
-                block_hook_name = f"blocks.{stop_at_layer}.hook_in"
-                hook_dict = self.hook_dict
-                if block_hook_name in hook_dict:
-                    hook_dict[block_hook_name].add_hook(stop_hook)
-                    hooks.append((hook_dict[block_hook_name], block_hook_name))
-        filtered_kwargs = kwargs.copy()
-        # `cache_device` is honored by `make_cache_hook` above (`tensor.detach().to(cache_device)`);
-        # the model and inputs stay where the caller put them, matching `ActivationCache.to`.
-        if cache_device is not None and getattr(self.cfg, "n_devices", 1) > 1:
-            # Moving a dispatched model to a single device collapses accelerate's
-            # split and breaks its routing hooks. The cache will stay spread across
-            # the per-layer devices; callers can .to(cache_device) on cache entries
-            # after the fact if they need a single-device cache.
-            warnings.warn(
-                f"run_with_cache(device={cache_device!r}) ignored: model is dispatched "
-                f"across {self.cfg.n_devices} devices via device_map. Cached activations "
-                "will remain on their per-layer devices.",
-                stacklevel=2,
-            )
+        self.context_level += 1
+        context_level = self.context_level
         try:
+            for hp, name in hooks:
+                pos_dim = _pos_axis_for_hook(name, hp)
+                hp.add_hook(make_cache_hook(name, pos_dim), level=context_level)
+                if incl_bwd:
+                    hp.add_hook(
+                        make_cache_hook(name, pos_dim, is_backward=True),
+                        dir="bwd",
+                        level=context_level,
+                    )
+            processed_args = [input]
+            if processed_args and isinstance(processed_args[0], str):
+                assert self.tokenizer is not None, "Tokenizer must be set to pass string input."
+                input_ids = self.to_tokens(processed_args[0])
+                input_ids = input_ids.to(next(self.original_model.parameters()).device)
+                kwargs["input_ids"] = input_ids
+                processed_args = processed_args[1:]
+            elif "input" in kwargs and isinstance(kwargs["input"], str):
+                assert self.tokenizer is not None, "Tokenizer must be set to pass string input."
+                input_ids = self.to_tokens(kwargs["input"])
+                input_ids = input_ids.to(next(self.original_model.parameters()).device)
+                kwargs["input_ids"] = input_ids
+                del kwargs["input"]
+            if stop_at_layer is not None and hasattr(self, "blocks"):
+                if stop_at_layer < 0:
+                    stop_at_layer = len(self.blocks) + stop_at_layer
+                last_layer_to_process = stop_at_layer - 1
+
+                def stop_hook(tensor: torch.Tensor, *, hook: Any) -> torch.Tensor:
+                    raise StopAtLayerException(tensor)
+
+                if stop_at_layer >= 0 and stop_at_layer < len(self.blocks):
+                    # Stop at the beginning of the specified block, not at the end of the previous block
+                    block_hook_name = f"blocks.{stop_at_layer}.hook_in"
+                    hook_dict = self.hook_dict
+                    if block_hook_name in hook_dict:
+                        hook_dict[block_hook_name].add_hook(stop_hook, level=context_level)
+                        hooks.append((hook_dict[block_hook_name], block_hook_name))
+            filtered_kwargs = kwargs.copy()
+            # `cache_device` is honored by `make_cache_hook` above (`tensor.detach().to(cache_device)`);
+            # the model and inputs stay where the caller put them, matching `ActivationCache.to`.
+            if cache_device is not None and getattr(self.cfg, "n_devices", 1) > 1:
+                # Moving a dispatched model to a single device collapses accelerate's
+                # split and breaks its routing hooks. The cache will stay spread across
+                # the per-layer devices; callers can .to(cache_device) on cache entries
+                # after the fact if they need a single-device cache.
+                warnings.warn(
+                    f"run_with_cache(device={cache_device!r}) ignored: model is dispatched "
+                    f"across {self.cfg.n_devices} devices via device_map. Cached activations "
+                    "will remain on their per-layer devices.",
+                    stacklevel=2,
+                )
             if (
                 "output_attentions" not in filtered_kwargs
                 and self.adapter.supports_hf_output_attentions
@@ -2305,13 +2501,37 @@ class TransformerBridge(HookIntrospectionMixin, nn.Module):
                 output = self.forward(**filtered_kwargs)
             if hasattr(output, "logits"):
                 output = output.logits
+            if incl_bwd:
+                # Gradients land in the cache via the bwd hooks, which the finally below removes,
+                # so the backward pass has to happen inside this try.
+                if not isinstance(output, torch.Tensor) or output.numel() != 1:
+                    shape = tuple(output.shape) if isinstance(output, torch.Tensor) else None
+                    raise ValueError(
+                        "incl_bwd=True needs a scalar output to call backward() on, got "
+                        f"{type(output).__name__}{f' of shape {shape}' if shape else ''}. "
+                        'Pass return_type="loss".'
+                    )
+                if not output.requires_grad:
+                    raise ValueError(
+                        "incl_bwd=True got an output with no grad_fn — the model's parameters "
+                        "have requires_grad=False, so there is nothing to differentiate."
+                    )
+                output.backward()
         except StopAtLayerException as e:
             output = e.layer_output
         except Exception as e:
             raise e
         finally:
-            for hp, _ in hooks:
-                hp.remove_hooks(dir="fwd")
+            if reset_hooks_end:
+                for hp, _ in hooks:
+                    # `level` keeps this to the hooks added above — hooks the caller
+                    # attached before the call survive.
+                    hp.remove_hooks(dir="fwd", level=context_level)
+                    if incl_bwd:
+                        hp.remove_hooks(dir="bwd", level=context_level)
+                    if clear_contexts:
+                        hp.clear_context()
+            self.context_level -= 1
         if self.compatibility_mode == True:
             reverse_aliases = {}
             for old_name, new_name in aliases.items():
@@ -2320,21 +2540,29 @@ class TransformerBridge(HookIntrospectionMixin, nn.Module):
                         reverse_aliases[single_new_name] = old_name
                 else:
                     reverse_aliases[new_name] = old_name
+            # Gradient entries are keyed "<hook_name>_grad", so alias lookups run on the
+            # base name and the suffix is re-attached to the aliased key.
+            suffixes = ("", "_grad") if incl_bwd else ("",)
             cache_items_to_add = {}
             for cache_name, cached_value in cache.items():
-                for new_name, old_name in reverse_aliases.items():
-                    if cache_name == new_name:
-                        cache_items_to_add[old_name] = cached_value
-                        break
+                base_name, suffix = (
+                    (cache_name[: -len("_grad")], "_grad")
+                    if cache_name.endswith("_grad")
+                    else (cache_name, "")
+                )
+                old_name = reverse_aliases.get(base_name)
+                if old_name is not None:
+                    cache_items_to_add[old_name + suffix] = cached_value
             cache.update(cache_items_to_add)
             for alias_name, target_name in aliases.items():
-                if isinstance(target_name, list):
-                    for single_target in target_name:
-                        if single_target in cache and alias_name not in cache:
-                            cache[alias_name] = cache[single_target]
+                targets = target_name if isinstance(target_name, list) else [target_name]
+                for suffix in suffixes:
+                    if alias_name + suffix in cache:
+                        continue
+                    for single_target in targets:
+                        if single_target + suffix in cache:
+                            cache[alias_name + suffix] = cache[single_target + suffix]
                             break
-                elif target_name in cache and alias_name not in cache:
-                    cache[alias_name] = cache[target_name]
         if return_cache_object:
             activation_cache = ActivationCache(cache, self, has_batch_dim=True)
             if remove_batch_dim:
@@ -2379,6 +2607,9 @@ class TransformerBridge(HookIntrospectionMixin, nn.Module):
             Model output
         """
         added_hooks: List[Tuple[HookPoint, Literal["fwd", "bwd"]]] = []
+        # Claimed here for the closures below, but only committed to self inside the try that
+        # decrements it, so a raise in between can't leave the counter incremented.
+        context_level = self.context_level + 1
         effective_stop_layer = None
         if stop_at_layer is not None and hasattr(self, "blocks"):
             if stop_at_layer < 0:
@@ -2401,25 +2632,12 @@ class TransformerBridge(HookIntrospectionMixin, nn.Module):
                 if hook_point.name is not None:
                     alias_names_list.append(hook_point.name)
                 alias_names_list.append(name)
-                hook_point.add_hook(hook_fn, dir=dir, alias_names=alias_names_list)
+                hook_point.add_hook(
+                    hook_fn, dir=dir, alias_names=alias_names_list, level=context_level
+                )
             else:
-                hook_point.add_hook(hook_fn, dir=dir)
+                hook_point.add_hook(hook_fn, dir=dir, level=context_level)
             added_hooks.append((hook_point, dir))
-
-        if stop_at_layer is not None and hasattr(self, "blocks"):
-            if stop_at_layer < 0:
-                stop_at_layer = len(self.blocks) + stop_at_layer
-            last_layer_to_process = stop_at_layer - 1
-
-            def stop_hook(tensor: torch.Tensor, *, hook: Any) -> torch.Tensor:
-                raise StopAtLayerException(tensor)
-
-            if stop_at_layer >= 0 and stop_at_layer < len(self.blocks):
-                # Stop at the beginning of the specified block, not at the end of the previous block
-                block_hook_name = f"blocks.{stop_at_layer}.hook_in"
-                hook_dict = self.hook_dict
-                if block_hook_name in hook_dict:
-                    add_hook_to_point(hook_dict[block_hook_name], stop_hook, block_hook_name, "fwd")
 
         def apply_hooks(hooks: List[Tuple[Union[str, Callable], Callable]], is_fwd: bool):
             direction: Literal["fwd", "bwd"] = "fwd" if is_fwd else "bwd"
@@ -2462,6 +2680,24 @@ class TransformerBridge(HookIntrospectionMixin, nn.Module):
                             add_hook_to_point(hook_point, hook_fn, hook_name_to_use, direction)
 
         try:
+            self.context_level = context_level
+            if stop_at_layer is not None and hasattr(self, "blocks"):
+                if stop_at_layer < 0:
+                    stop_at_layer = len(self.blocks) + stop_at_layer
+                last_layer_to_process = stop_at_layer - 1
+
+                def stop_hook(tensor: torch.Tensor, *, hook: Any) -> torch.Tensor:
+                    raise StopAtLayerException(tensor)
+
+                if stop_at_layer >= 0 and stop_at_layer < len(self.blocks):
+                    # Stop at the beginning of the specified block, not at the end of the previous block
+                    block_hook_name = f"blocks.{stop_at_layer}.hook_in"
+                    hook_dict = self.hook_dict
+                    if block_hook_name in hook_dict:
+                        add_hook_to_point(
+                            hook_dict[block_hook_name], stop_hook, block_hook_name, "fwd"
+                        )
+
             apply_hooks(fwd_hooks, True)
             apply_hooks(bwd_hooks, False)
             try:
@@ -2474,7 +2710,12 @@ class TransformerBridge(HookIntrospectionMixin, nn.Module):
         finally:
             if reset_hooks_end:
                 for hook_point, direction in added_hooks:
-                    hook_point.remove_hooks(dir=direction)
+                    # `level` keeps this to the hooks added above — hooks the caller
+                    # attached before the call survive.
+                    hook_point.remove_hooks(dir=direction, level=context_level)
+                    if clear_contexts:
+                        hook_point.clear_context()
+            self.context_level -= 1
 
     def _resolve_stopping_criteria(
         self,
@@ -3995,8 +4236,10 @@ class TransformerBridge(HookIntrospectionMixin, nn.Module):
         Args:
             fwd_hooks: List of (hook_name, hook_fn) tuples for forward hooks
             bwd_hooks: List of (hook_name, hook_fn) tuples for backward hooks
-            reset_hooks_end: If True, removes hooks when context exits
-            clear_contexts: Unused (for compatibility with HookedTransformer)
+            reset_hooks_end: If True, removes the hooks this context added when it exits.
+                Hooks the caller added beforehand are left alone either way.
+            clear_contexts: If True, clears the hook contexts of the touched hook points
+                when the hooks are removed
 
         Example:
             with model.hooks(fwd_hooks=[("hook_embed", my_hook)]):
@@ -4006,6 +4249,9 @@ class TransformerBridge(HookIntrospectionMixin, nn.Module):
         @contextmanager
         def _hooks_context():
             added_hooks: List[Tuple[HookPoint, Literal["fwd", "bwd"]]] = []
+            # Claimed here for the closures below, but only committed to self inside the try
+            # that decrements it, so a raise in between can't leave the counter incremented.
+            context_level = self.context_level + 1
 
             def add_hook_to_point(
                 hook_point: HookPoint,
@@ -4018,9 +4264,11 @@ class TransformerBridge(HookIntrospectionMixin, nn.Module):
                     if hook_point.name is not None:
                         alias_names_list.append(hook_point.name)
                     alias_names_list.append(name)
-                    hook_point.add_hook(hook_fn, dir=dir, alias_names=alias_names_list)
+                    hook_point.add_hook(
+                        hook_fn, dir=dir, alias_names=alias_names_list, level=context_level
+                    )
                 else:
-                    hook_point.add_hook(hook_fn, dir=dir)
+                    hook_point.add_hook(hook_fn, dir=dir, level=context_level)
                 added_hooks.append((hook_point, dir))
 
             def apply_hooks(hooks: List[Tuple[Union[str, Callable], Callable]], is_fwd: bool):
@@ -4049,13 +4297,19 @@ class TransformerBridge(HookIntrospectionMixin, nn.Module):
                                 add_hook_to_point(hook_point, hook_fn, hook_name_to_use, direction)
 
             try:
+                self.context_level = context_level
                 apply_hooks(fwd_hooks, True)
                 apply_hooks(bwd_hooks, False)
                 yield self
             finally:
                 if reset_hooks_end:
                     for hook_point, direction in added_hooks:
-                        hook_point.remove_hooks(dir=direction)
+                        # `level` keeps this to the hooks added above — hooks the caller
+                        # attached before the context survive.
+                        hook_point.remove_hooks(dir=direction, level=context_level)
+                        if clear_contexts:
+                            hook_point.clear_context()
+                self.context_level -= 1
 
         return _hooks_context()
 
@@ -4103,7 +4357,8 @@ class TransformerBridge(HookIntrospectionMixin, nn.Module):
         self._propagate_attention_flag("use_attn_in", use_attn_in)
 
     def set_use_hook_mlp_in(self, use_hook_mlp_in: bool) -> None:
-        """Toggle the pre-ln2 ``hook_mlp_in`` HookPoint, matching legacy semantics.
+        """Toggle the ``hook_mlp_in`` HookPoint (the MLP-branch entry: pre-ln2, or
+        the MLP input on post-norm blocks), matching legacy semantics.
 
         See :py:meth:`HookedTransformer.set_use_hook_mlp_in`.
         """
