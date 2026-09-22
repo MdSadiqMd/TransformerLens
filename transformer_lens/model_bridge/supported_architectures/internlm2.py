@@ -1,6 +1,5 @@
 """InternLM2 architecture adapter."""
 
-import sys
 from typing import Any
 
 import torch
@@ -20,6 +19,11 @@ from transformer_lens.model_bridge.generalized_components import (
     LinearBridge,
     RMSNormalizationBridge,
     UnembeddingBridge,
+)
+from transformer_lens.model_bridge.supported_architectures._remote_code_compat import (
+    force_import_remote_class,
+    iter_remote_modeling_modules,
+    patch_init_weights_skip_loaded,
 )
 
 
@@ -55,45 +59,16 @@ class _InternLM2AttentionBridge(JointQKVPositionEmbeddingsAttentionBridge):
         return (attn_output, attn_weights, past_key_value)
 
 
-def _patch_init_weights_for_internlm2() -> None:
-    """Prevent _init_weights from re-randomizing loaded checkpoint weights.
-
-    Transformers v5 calls _init_weights on all modules after weight
-    materialization. For modules with real (non-meta) tensors, we must
-    skip re-initialization to preserve the loaded checkpoint values.
-    Same approach as openelm.py.
-    """
-    for key in list(sys.modules.keys()):
-        if "internlm2" not in key.lower() or "modeling" not in key.lower():
-            continue
-        module = sys.modules[key]
-        pretrained_cls = getattr(module, "InternLM2PreTrainedModel", None)
-        if pretrained_cls is None or getattr(pretrained_cls, "_tl_patched", False):
-            continue
-
-        original_init_weights = pretrained_cls._init_weights
-
-        def safe_init_weights(self, mod, _original=original_init_weights):  # type: ignore[no-untyped-def]
-            first_param = next(mod.parameters(), None)
-            if first_param is not None and first_param.device.type != "meta":
-                return
-            _original(self, mod)
-
-        pretrained_cls._init_weights = safe_init_weights
-        pretrained_cls._tl_patched = True
-
-
 class InternLM2ArchitectureAdapter(ArchitectureAdapter):
     """Architecture adapter for InternLM2 models.
 
     InternLM2 uses remote code (trust_remote_code=True) and differs from Llama in:
-    - Fused interleaved GQA wqkv weight (not standard [Q|K|V] split)
+    - Fused interleaved GQA wqkv weight (not standard [Q|K|V] split). The attention
+      bridge splits it at load and drops the fused key from the state dict, so
+      fold_ln sees ordinary q/k/v keys and needs no special handling here.
     - Non-standard module names: tok_embeddings, output, attention, feed_forward,
       wqkv/wo, w1(gate)/w3(up)/w2(down), attention_norm, ffn_norm
     - Per-layer rotary_emb (no model-level shared instance)
-    - supports_fold_ln=False: fold_ln is done manually in preprocess_weights because
-      the bridge state dict has the fused qkv key, not split q/k/v keys, so
-      fold_layer_norm's extract_attention_tensors_for_folding would silently skip attn.
 
     Optional parameters (may not exist in state_dict):
     - blocks.{i}.attn.b_Q / b_K / b_V / b_O — config.bias=False on shipped models
@@ -105,10 +80,6 @@ class InternLM2ArchitectureAdapter(ArchitectureAdapter):
         super().__init__(cfg)
 
         self._set_rms_rotary_defaults()
-
-        # Standard fold_ln silently skips attention when wqkv is fused (see class docstring).
-        # preprocess_weights() handles it instead — same approach as phi3.py.
-        self.supports_fold_ln = False
 
         n_kv_heads = getattr(cfg, "n_key_value_heads", None) or cfg.n_heads
 
@@ -230,102 +201,11 @@ class InternLM2ArchitectureAdapter(ArchitectureAdapter):
         patch_dynamic_cache_v5()
 
         # Force-import the remote modeling module so we can patch _init_weights.
-        try:
-            from transformers.dynamic_module_utils import get_class_from_dynamic_module
+        force_import_remote_class(model_name, "modeling_internlm2.InternLM2ForCausalLM")
 
-            get_class_from_dynamic_module(
-                "modeling_internlm2.InternLM2ForCausalLM",
-                model_name,
-            )
-        except Exception:
-            pass
-
-        _patch_init_weights_for_internlm2()
-
-    def preprocess_weights(self, state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """Fold layer norms into QKV and MLP weights.
-
-        Standard fold_ln can't reach split Q/K/V when wqkv is fused in the bridge state dict.
-        We extract and fold here, then write split keys so RearrangeTensorConversion can follow.
-        MLP projections (w1/w2/w3) are separate linears so they fold normally.
-        Mirrors phi3.py.preprocess_weights, adapted for InternLM2's layout.
-        """
-        fold_ln = getattr(self, "_fold_ln_requested", True)
-        if not fold_ln:
-            return state_dict
-
-        n_kv_heads = getattr(self.cfg, "n_key_value_heads", None) or self.cfg.n_heads
-        n_kv_groups = self.cfg.n_heads // n_kv_heads
-        head_dim = self.cfg.d_model // self.cfg.n_heads
-        gs = n_kv_groups + 2
-
-        for i in range(self.cfg.n_layers):
-            # --- Fold ln1 into Q/K/V (extracted from interleaved wqkv) ---
-            qkv_key = f"blocks.{i}.attn.qkv.weight"
-            ln1_key = f"blocks.{i}.ln1.weight"
-            if qkv_key in state_dict and ln1_key in state_dict:
-                ln1_w = state_dict[ln1_key].float()
-                qkv_w = state_dict[qkv_key].float()
-                d_model = qkv_w.shape[1]
-                orig_dtype = state_dict[qkv_key].dtype
-
-                w_grouped = qkv_w.reshape(n_kv_heads, gs, head_dim, d_model)
-                q_w = w_grouped[:, :n_kv_groups, :, :].reshape(self.cfg.n_heads * head_dim, d_model)
-                k_w = w_grouped[:, n_kv_groups, :, :].reshape(n_kv_heads * head_dim, d_model)
-                v_w = w_grouped[:, n_kv_groups + 1, :, :].reshape(n_kv_heads * head_dim, d_model)
-
-                state_dict[f"blocks.{i}.attn.q.weight"] = (q_w * ln1_w[None, :]).to(orig_dtype)
-                state_dict[f"blocks.{i}.attn.k.weight"] = (k_w * ln1_w[None, :]).to(orig_dtype)
-                state_dict[f"blocks.{i}.attn.v.weight"] = (v_w * ln1_w[None, :]).to(orig_dtype)
-                del state_dict[qkv_key]
-                state_dict[ln1_key] = torch.ones_like(state_dict[ln1_key])
-
-            qkv_bias_key = f"blocks.{i}.attn.qkv.bias"
-            if qkv_bias_key in state_dict:
-                b = state_dict[qkv_bias_key]
-                expected_len = (self.cfg.n_heads + 2 * n_kv_heads) * head_dim
-                if b.shape[0] != expected_len:
-                    raise ValueError(
-                        f"Unexpected wqkv bias shape at layer {i}: {b.shape[0]} "
-                        f"(expected {expected_len}). Cannot split interleaved bias."
-                    )
-                orig_dtype = b.dtype
-                b_f = b.float()
-                b_grouped = b_f.reshape(n_kv_heads, gs, head_dim)
-                q_b = b_grouped[:, :n_kv_groups, :].reshape(self.cfg.n_heads * head_dim)
-                k_b = b_grouped[:, n_kv_groups, :].reshape(n_kv_heads * head_dim)
-                v_b = b_grouped[:, n_kv_groups + 1, :].reshape(n_kv_heads * head_dim)
-                state_dict[f"blocks.{i}.attn.q.bias"] = q_b.to(orig_dtype)
-                state_dict[f"blocks.{i}.attn.k.bias"] = k_b.to(orig_dtype)
-                state_dict[f"blocks.{i}.attn.v.bias"] = v_b.to(orig_dtype)
-                del state_dict[qkv_bias_key]
-
-            # --- Fold ln2 into MLP gate (w1) and up (w3) projections ---
-            ln2_key = f"blocks.{i}.ln2.weight"
-            if ln2_key in state_dict:
-                ln2_w = state_dict[ln2_key].float()
-                for mlp_key in [
-                    f"blocks.{i}.mlp.gate.weight",
-                    f"blocks.{i}.mlp.in.weight",
-                ]:
-                    if mlp_key in state_dict:
-                        orig_dtype = state_dict[mlp_key].dtype
-                        state_dict[mlp_key] = (state_dict[mlp_key].float() * ln2_w[None, :]).to(
-                            orig_dtype
-                        )
-                state_dict[ln2_key] = torch.ones_like(state_dict[ln2_key])
-
-        # --- Fold ln_final into unembed ---
-        ln_final_key = "ln_final.weight"
-        unembed_key = "unembed.weight"
-        if ln_final_key in state_dict and unembed_key in state_dict:
-            ln_w = state_dict[ln_final_key].float()
-            u_w = state_dict[unembed_key].float()
-            orig_dtype = state_dict[unembed_key].dtype
-            if u_w.shape[-1] == ln_w.shape[0]:
-                state_dict[unembed_key] = (u_w * ln_w[None, :]).to(orig_dtype)
-            elif u_w.shape[0] == ln_w.shape[0]:
-                state_dict[unembed_key] = (u_w * ln_w[:, None]).to(orig_dtype)
-            state_dict[ln_final_key] = torch.ones_like(state_dict[ln_final_key])
-
-        return state_dict
+        # v5 calls _init_weights on all modules after weight materialization;
+        # skip already-real tensors so checkpoint values survive.
+        for module in iter_remote_modeling_modules("internlm2"):
+            pretrained_cls = getattr(module, "InternLM2PreTrainedModel", None)
+            if pretrained_cls is not None:
+                patch_init_weights_skip_loaded(pretrained_cls)

@@ -147,7 +147,6 @@ class TestJointQKVAttention:
         # Run forward pass with identity hook to get baseline
         baseline_output, _ = qkv_bridge(test_input)
 
-        # Remove the identity hook
         qkv_bridge.q.hook_out.remove_hooks()
 
         # Add a hook to q.hook_out that modifies the output
@@ -159,7 +158,6 @@ class TestJointQKVAttention:
             q_mutation_applied = True
             return q_output + q_mutated_value
 
-        # Add the hook to q.hook_out
         qkv_bridge.q.hook_out.add_hook(q_hook_fn)
 
         # Run forward pass with hook
@@ -227,13 +225,11 @@ class TestJointQKVAttention:
         def k_hook_id_fn(k_output, hook):
             return k_output
 
-        # Add the hook to k.hook_out
         qkv_bridge.k.hook_out.add_hook(k_hook_id_fn)
 
         # Run forward pass with identity hook to get baseline
         baseline_output, _ = qkv_bridge(test_input)
 
-        # Remove the identity hook
         qkv_bridge.k.hook_out.remove_hooks()
 
         # Add a hook to k.hook_out that modifies the output
@@ -243,10 +239,8 @@ class TestJointQKVAttention:
         def k_hook_fn(k_output, hook):
             nonlocal k_mutation_applied
             k_mutation_applied = True
-            # Modify the k output by adding a distinct value
             return k_output + k_mutated_value
 
-        # Add the hook to k_hook_out
         qkv_bridge.k.hook_out.add_hook(k_hook_fn)
 
         # Run forward pass with hook
@@ -314,13 +308,11 @@ class TestJointQKVAttention:
         def v_hook_id_fn(v_output, hook):
             return v_output
 
-        # Add the hook to v.hook_out
         qkv_bridge.v.hook_out.add_hook(v_hook_id_fn)
 
         # Run forward pass with identity hook to get baseline
         baseline_output, _ = qkv_bridge(test_input)
 
-        # Remove the identity hook
         qkv_bridge.v.hook_out.remove_hooks()
 
         # Add a hook to v.hook_out that modifies the output
@@ -330,10 +322,8 @@ class TestJointQKVAttention:
         def v_hook_fn(v_output, hook):
             nonlocal v_mutation_applied
             v_mutation_applied = True
-            # Modify the v output by adding a distinct value
             return v_output + v_mutated_value
 
-        # Add the hook to v.hook_out
         qkv_bridge.v.hook_out.add_hook(v_hook_fn)
 
         # Run forward pass with hook
@@ -486,7 +476,7 @@ class TestJointQKVAttention:
         )
 
     def test_deepcopy_does_not_copy_bound_method_self(self):
-        """Deepcopy shares split_qkv_matrix and config instead of copying them."""
+        """Deepcopy shares split_qkv_matrix, and shares a config no live Bridge owns."""
 
         class FakeAdapter:
             def __init__(self):
@@ -510,6 +500,9 @@ class TestJointQKVAttention:
 
         assert clone.split_qkv_matrix is bridge.split_qkv_matrix
         assert clone.split_qkv_matrix.__self__ is adapter
+        # Unowned config: this is block-template replication, where every layer clone
+        # has to land on the one live config rather than forking one config per layer.
+        assert getattr(bridge.config, "_bridge_ref", None) is None
         assert clone.config is bridge.config
 
     def test_deepcopy_produces_independent_hooks(self):
@@ -527,3 +520,48 @@ class TestJointQKVAttention:
         assert clone.q is not bridge.q
         assert clone.k is not bridge.k
         assert clone.v is not bridge.v
+
+    def test_deepcopied_bridge_attention_follows_the_clone_config(self):
+        """A cloned Bridge's attention reads the clone's cfg, so flags rewire one model only.
+
+        Paired ablation work keeps a pristine control model beside a deepcopied
+        treatment model; if the clone's attention still points at the original's
+        config, every flag write on either one silently rewires both forwards.
+        """
+        from transformers import GPT2Config, GPT2LMHeadModel
+
+        from transformer_lens.model_bridge.sources._bridge_builder import (
+            build_bridge_from_module,
+        )
+
+        hf_config = GPT2Config(
+            n_layer=2, n_head=2, n_embd=32, n_positions=8, n_ctx=8, vocab_size=16
+        )
+        bridge = build_bridge_from_module(
+            GPT2LMHeadModel(hf_config).eval(),
+            "GPT2LMHeadModel",
+            hf_config=hf_config,
+            tokenizer=None,
+            device="cpu",
+        )
+        # GPT-2 shares one config across its attention blocks, so it is the arch where
+        # a clone inheriting the original's config would leak.
+        assert bridge.blocks[0].attn.config is bridge.cfg
+
+        clone = copy.deepcopy(bridge)
+        clone.cfg.use_attn_result = True
+        bridge.cfg.use_split_qkv_input = True
+
+        assert bridge.cfg.use_attn_result is False
+        assert clone.cfg.use_split_qkv_input is False
+        for original_block, clone_block in zip(bridge.blocks, clone.blocks):
+            assert original_block.attn.config is bridge.cfg
+            assert clone_block.attn.config is clone.cfg
+
+        gated_hooks = ["blocks.0.attn.hook_result", "blocks.0.attn.hook_q_input"]
+        tokens = torch.randint(0, bridge.cfg.d_vocab, (1, 4))
+        _, clone_cache = clone.run_with_cache(tokens, names_filter=gated_hooks)
+        _, original_cache = bridge.run_with_cache(tokens, names_filter=gated_hooks)
+
+        assert list(clone_cache) == ["blocks.0.attn.hook_result"]
+        assert list(original_cache) == ["blocks.0.attn.hook_q_input"]

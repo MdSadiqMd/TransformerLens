@@ -1,7 +1,8 @@
 """TL-native transformer for TransformerBridge — minimal, no HF/HT dependency.
 
-Cfg-driven features: ``normalization_type`` (LN / RMS / RMSPre), ``final_rms``,
-``gated_mlp``, ``attn_only``, ``n_key_value_heads`` (GQA), ``attn_scores_soft_cap``,
+Cfg-driven features: ``normalization_type`` (LN / RMS / LNPre / RMSPre —
+the ``Pre`` variants are param-free), ``final_rms``, ``gated_mlp``,
+``attn_only``, ``n_key_value_heads`` (GQA), ``attn_scores_soft_cap``,
 ``output_logits_soft_cap``, ``positional_embedding_type`` (standard / rotary),
 ``rotary_dim`` / ``rotary_base`` / ``rope_scaling`` (linear PI, dynamic/NTK,
 llama3 by-parts).
@@ -29,6 +30,11 @@ _ACTIVATIONS: dict[str, _Activation] = {
     "relu": F.relu,
     "silu": F.silu,
     "swish": F.silu,
+    # SoLU (https://transformer-circuits.pub/2022/solu/index.html): x*softmax(x).
+    # "solu_ln" is the same activation; the mid-MLP LayerNorm that follows it is
+    # a NativeMLP submodule, not part of the pointwise function.
+    "solu": lambda x: x * F.softmax(x, dim=-1),
+    "solu_ln": lambda x: x * F.softmax(x, dim=-1),
 }
 
 
@@ -66,11 +72,52 @@ class NativeRMSNorm(nn.Module):
         return self.weight * normalized
 
 
+class NativeRMSNormPre(nn.Module):
+    """Param-free RMSNorm — normalization only, no learnable scale."""
+
+    def __init__(self, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_dtype = x.dtype
+        x_fp32 = x.to(torch.float32)
+        rms_inv = torch.rsqrt(x_fp32.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return (x_fp32 * rms_inv).to(input_dtype)
+
+
+class NativeLayerNormPre(nn.Module):
+    """Param-free LayerNorm — center + normalize only, no learnable scale/bias."""
+
+    def __init__(self, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_dtype = x.dtype
+        x_fp32 = x.to(torch.float32)
+        x_fp32 = x_fp32 - x_fp32.mean(dim=-1, keepdim=True)
+        scale = (x_fp32.pow(2).mean(dim=-1, keepdim=True) + self.eps).sqrt()
+        return (x_fp32 / scale).to(input_dtype)
+
+
+def _uses_param_free_norm(cfg: TransformerBridgeConfig) -> bool:
+    return _normalization_type(cfg) in ("RMSPRE", "LNPRE")
+
+
 def _make_norm(cfg: TransformerBridgeConfig, *, force_rms: bool = False) -> nn.Module:
+    param_free = _uses_param_free_norm(cfg)
     if force_rms or _uses_rms_norm(cfg):
+        # final_rms swaps the norm family but must not reintroduce a scale the
+        # checkpoint doesn't carry.
+        if param_free:
+            return NativeRMSNormPre(eps=cfg.eps)
         return NativeRMSNorm(cfg.d_model, eps=cfg.eps)
+    if _normalization_type(cfg) == "LNPRE":
+        return NativeLayerNormPre(eps=cfg.eps)
     if _uses_no_norm(cfg):
         return nn.Identity()
+
     return nn.LayerNorm(cfg.d_model, eps=cfg.eps)
 
 
@@ -201,8 +248,15 @@ class NativeRotary(nn.Module):
 
 
 class NativeAttention(nn.Module):
-    """Split-QKV causal self-attention. Returns (out, pattern); AttentionBridge
-    fires ``hook_pattern`` off the second element."""
+    """Split-QKV causal self-attention. Returns (out, pattern).
+
+    ``accepts_pattern_fn``: AttentionBridge injects its ``hook_pattern`` as
+    ``pattern_fn``, applied BEFORE the value matmul — so hook edits genuinely
+    re-weight the attention output instead of only decorating the returned
+    tuple (which the wrapper cannot recompute from).
+    """
+
+    accepts_pattern_fn = True
 
     causal_mask: torch.Tensor
 
@@ -252,6 +306,7 @@ class NativeAttention(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        pattern_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch, seq, _ = hidden_states.shape
@@ -281,6 +336,11 @@ class NativeAttention(nn.Module):
         scores = scores.masked_fill(block_mask, float("-inf"))
 
         pattern = F.softmax(scores, dim=-1)
+        # Fully masked padding queries softmax to NaN; overwrite masked entries
+        # so those rows contribute a zero attention update instead of poisoning later layers.
+        pattern = pattern.masked_fill(block_mask, 0.0)
+        if pattern_fn is not None:
+            pattern = pattern_fn(pattern)
 
         attn = torch.matmul(pattern, v).transpose(1, 2).contiguous().view(batch, seq, -1)
         out = self.o(attn)
@@ -326,9 +386,19 @@ class NativeMLP(nn.Module):
         if act_name not in _ACTIVATIONS:
             raise ValueError(f"Unsupported act_fn={act_name!r}. Supported: {sorted(_ACTIVATIONS)}")
         self.act = _ACTIVATIONS[act_name]
+        # SoLU-LN models (NeelNanda's SoLU family) apply a LayerNorm between the
+        # activation and the out-projection; without it their checkpoints load
+        # but compute the wrong function. Named ``ln`` to match the legacy
+        # property-format key blocks.{i}.mlp.ln.{w,b}.
+        self.ln: Optional[nn.LayerNorm] = (
+            nn.LayerNorm(d_mlp, eps=cfg.eps) if act_name == "solu_ln" else None
+        )
 
     def forward(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
-        return self.fc_out(self.act(self.fc_in(hidden_states)))
+        mid = self.act(self.fc_in(hidden_states))
+        if self.ln is not None:
+            mid = self.ln(mid)
+        return self.fc_out(mid)
 
 
 class NativeGatedMLP(nn.Module):
@@ -436,15 +506,27 @@ class NativeModel(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Returns logits directly."""
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("Exactly one of input_ids or inputs_embeds must be provided.")
+        if input_ids is not None:
+            model_input = input_ids
+            hidden_states = self.tok_embed(input_ids)
+        elif inputs_embeds is not None:
+            model_input = inputs_embeds
+            hidden_states = inputs_embeds
+        else:
+            raise ValueError("Exactly one of input_ids or inputs_embeds must be provided.")
+
         # Bounds check up front so both absolute and rotary paths produce a
         # self-explanatory error rather than IndexError / shape mismatch.
-        seq_len = input_ids.shape[-1]
+        seq_len = model_input.shape[1]
         if seq_len > self.cfg.n_ctx:
             raise ValueError(
                 f"input length {seq_len} exceeds n_ctx={self.cfg.n_ctx}; "
@@ -453,11 +535,12 @@ class NativeModel(nn.Module):
 
         # Resolve position_ids before the block loop so rotary sees the caller's
         # positions, not the dense default.
-        batch, seq = input_ids.shape
+        batch, seq = model_input.shape[:2]
         if position_ids is None:
-            position_ids = torch.arange(seq, device=input_ids.device).unsqueeze(0).expand(batch, -1)
+            position_ids = (
+                torch.arange(seq, device=model_input.device).unsqueeze(0).expand(batch, -1)
+            )
 
-        hidden_states = self.tok_embed(input_ids)
         if self.pos is not None:
             hidden_states = hidden_states + self.pos(position_ids)
 

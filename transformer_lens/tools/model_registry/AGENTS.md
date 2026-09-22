@@ -47,7 +47,6 @@ Read [the root AGENTS.md](../../../AGENTS.md) for project-wide rules. This file 
 | `--retry-failed` | Re-test status=3 (failed) entries |
 | `--dry-run` | Print what would be tested without running |
 | `--no-hf-reference` | Skip the HF reference — Phase 1 is structural-only, never numerically compared to HF. A passing run records `status=4` (PROVISIONAL), which does **not** count as verified. Re-run without the flag to upgrade to VERIFIED. |
-| `--no-ht-reference` | Skip the HookedTransformer comparison passes (faster, lower confidence) |
 | `--quiet` | Suppress per-model logging |
 
 ---
@@ -114,14 +113,14 @@ Never edit manually.
 | 1 | Core forward correctness vs HuggingFace logits |
 | 2 | Hook firing + gradient flow |
 | 3 | Weight processing (compatibility mode, fold/centre) |
-| 4 | Text-generation quality |
+| 4 | Text-generation quality (per-model prompt profile, scored by a pinned multilingual judge) |
 | 7 | Multimodal (vision/text alignment) — only Llava / Gemma3-multimodal |
 | 8 | Audio — Hubert (waveform) and AST (spectrogram) |
 | 9 | Vision — ViT/DeiT pixel forward, hook/cache firing, representation stability, classification decode |
 
-SSM / recurrent families and the hybrids (Mamba-1/2, gated-delta-net, NemotronH, GraniteMoeHybrid, Jamba, Qwen3.5/Qwen3-Next) declare `applicable_phases = [1, 2, 3, 4]` — all four apply. P2/P3 run but skip their HookedTransformer-comparison sub-tests (SSMs have no HT), which is scored as a pass.
+SSM / recurrent families and the hybrids (Mamba-1/2, gated-delta-net, NemotronH, GraniteMoeHybrid, Jamba, Qwen3.5/Qwen3-Next) declare `applicable_phases = [1, 2, 3, 4]` — all four apply. P2 runs bridge self-checks (hooks, cache, gradients); P3 checks processed-weight equivalence against the Phase-1 HF reference when available.
 
-**Non-text modalities.** `classify_architecture` routes audio architectures to `{1, 8}` and vision architectures (ViT/DeiT) to `{1, 9}` — vision has no tokenizer for P4, and neither modality has a HookedTransformer counterpart for P2/P3. Phases 1/8/9 build their input with `build_modality_input()` ([`benchmarks/utils.py`](../../benchmarks/utils.py)), which shapes it from the HF config: `[batch, max_length, num_mel_bins]` for spectrogram encoders, `[batch, samples]` for waveform encoders, `[batch, channels, image_size, image_size]` for vision. Add a new non-text architecture there rather than hardcoding a shape at the call site.
+**Non-text modalities.** `classify_architecture` routes audio architectures to `{1, 8}` and vision architectures (ViT/DeiT) to `{1, 9}` — vision has no tokenizer for P4, and neither modality produces the text logits/loss that P2/P3 compare. Phases 1/8/9 build their input with `build_modality_input()` ([`benchmarks/utils.py`](../../benchmarks/utils.py)), which shapes it from the HF config: `[batch, max_length, num_mel_bins]` for spectrogram encoders, `[batch, samples]` for waveform encoders, `[batch, channels, image_size, image_size]` for vision. Add a new non-text architecture there rather than hardcoding a shape at the call site.
 
 ### Phase-score thresholds
 
@@ -132,24 +131,26 @@ SSM / recurrent families and the hybrids (Mamba-1/2, gated-delta-net, NemotronH,
 | 1 | **100%** | — | `STATUS_FAILED` |
 | 2 | 75% | `logits_equivalence`, `loss_equivalence` | `STATUS_FAILED` |
 | 3 | 75% | `logits_equivalence`, `loss_equivalence` | `STATUS_FAILED` |
-| 4 | 50% | — | **Non-gating.** Below 50% adds `"low text quality"` to the registry `note`; never causes `STATUS_FAILED`. |
+| 4 | 54.5% — the measured pass line `p4_pass_threshold()` (score of the bake-off noise floor `JUDGE_R_GOOD`) | — | **Non-gating.** Below the line adds `"text quality poor (P4=…)"` to the registry `note`; never causes `STATUS_FAILED`. |
 | 7 | 75% | `multimodal_forward` | `STATUS_FAILED`. NULL score (processor unavailable) also fails. |
 | 8 | 75% | `audio_forward` | `STATUS_FAILED`. NULL score also fails. |
 | 9 | 75% | `vision_forward`, `vision_cache` | `STATUS_FAILED`. NULL score also fails. |
 
-Phase 4 is intentionally lenient — source ([`verify_models.py:554`](verify_models.py)) calls it *"a quality metric, not a correctness check."* The 50% bar asks "is the text coherent at all?" not "is this adapter clean?"
+P4 prompts each model with its resolved **prompt profile** — chat template, translation, code, own-language continuation, or another task kind — via `resolve_profile()` in [`benchmarks/text_quality_profiles.py`](../../benchmarks/text_quality_profiles.py) (precedence: per-model override > architecture rule > live HF Hub signals > stored registry value > default). The resolved profile is cached sparsely on the entry as `prompt_profile` (key omitted when it's just the default). Each generation is scored against a known-good reference by one pinned multilingual judge via the perplexity ratio `PPL(generated)/PPL(reference)`, which cancels the judge's per-language handicap; the pass/fail constants are measured, not hand-picked, in [`benchmarks/text_quality.py`](../../benchmarks/text_quality.py).
+
+Phase 4 is a quality metric, not a correctness check. Its floor is not hand-picked: it equals the benchmark pass line, derived from the judge bake-off's fluent-vs-fluent noise floor (`p4_pass_threshold()` in [`benchmarks/text_quality_profiles.py`](../../benchmarks/text_quality_profiles.py)), so the registry note and the benchmark verdict can never disagree.
 
 **For adapter authors:** a `STATUS_VERIFIED` entry with P4 well below 100% on a small parity-test model can still indicate a real bug the system doesn't gate on (e.g. missing `preprocess_weights` fold). Investigate manually even when VERIFIED.
 
 **Reading the result:**
 
 - `status==1` + `note="Full verification completed"` → all gates passed, no quality flag. Good.
-- `status==1` + `note` mentions `"low text quality"` → P4 < 50%; investigate.
+- `status==1` + `note` mentions `"text quality poor"` → P4 below the pass line; investigate (`scripts/phase4_review.py` orders the candidates and separates old-scale scores).
 - `status==1` + P4 < 100% on a small model, no quality flag → potential weight-fold/tokenizer bug; investigate.
 - `status==3` (FAILED) → `note` carries the failure reason; debug from there.
 - `status==4` (PROVISIONAL) → structural-only pass via `--no-hf-reference`; Phase 1 was never numerically compared to HF, so it does **not** count as verified (`note` is prefixed `Structural only (no HF reference)`). Re-run without the flag for a real verification.
 
-P1/P3 failures: [supported_architectures/AGENTS.md §When to override preprocess_weights](../../model_bridge/supported_architectures/AGENTS.md#when-to-override-preprocess_weights), [debugging_numerical_divergence.md](../../../docs/source/content/debugging_numerical_divergence.md). P4 drift: [§Tokenizer policy](../../model_bridge/supported_architectures/AGENTS.md#tokenizer-policy) (logit-scale / embedding-scale folds typically degrade P4 without crossing the 50% gate).
+P1/P3 failures: [supported_architectures/AGENTS.md §When to override preprocess_weights](../../model_bridge/supported_architectures/AGENTS.md#when-to-override-preprocess_weights), [debugging_numerical_divergence.md](../../../docs/source/content/debugging_numerical_divergence.md). P4 drift: [§Tokenizer policy](../../model_bridge/supported_architectures/AGENTS.md#tokenizer-policy) (logit-scale / embedding-scale folds typically degrade P4 without crossing the pass line).
 
 ---
 

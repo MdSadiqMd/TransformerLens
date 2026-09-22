@@ -11,13 +11,15 @@ import torch
 from torch import nn
 
 if TYPE_CHECKING:
-    from transformer_lens.config.hooked_transformer_config import (
-        HookedTransformerConfig as ConfigType,
+    from transformer_lens.config.transformer_bridge_config import (
+        TransformerBridgeConfig as ConfigType,
+    )
+    from transformer_lens.config.transformer_lens_config import (
+        TransformerLensConfig as BaseConfigType,
     )
 else:
     ConfigType = Any
-
-_UNSUPPORTED_OFFLOAD_DEVICE_MAP_VALUES = {"disk"}
+    BaseConfigType = Any
 
 AvailableDeviceMemory = list[tuple[int, int]]
 """
@@ -106,7 +108,7 @@ def get_best_available_device(
     """Gets the best available device to be used based on the passed in arguments
 
     Args:
-        cfg: The HookedTransformerConfig object containing device configuration
+        cfg: The bridge config object containing device configuration
 
     Returns:
         torch.device: The best available device
@@ -122,7 +124,7 @@ def get_best_available_device(
 
 def get_device_for_block_index(
     index: int,
-    cfg: ConfigType,
+    cfg: "BaseConfigType",
     device: Optional[Union[torch.device, str]] = None,
 ):
     """
@@ -156,7 +158,8 @@ def get_device_for_block_index(
     # the divide-by-zero when n_layers < n_devices. The naive form
     # `index // (n_layers // n_devices)` floors the divisor and overshoots when
     # n_layers is not a multiple of n_devices (e.g. 62 layers / 8 devices → 8).
-    device_index = (device.index or 0) + (index * cfg.n_devices) // cfg.n_layers
+    n_devices = getattr(cfg, "n_devices", 1)
+    device_index = (device.index or 0) + (index * n_devices) // cfg.n_layers
     return torch.device(device.type, device_index)
 
 
@@ -204,52 +207,60 @@ def resolve_device_map(
 def _validate_device_map_values(
     device_map: Union[str, Dict[str, Union[str, int]]],
 ) -> None:
-    """Reject explicit disk values and mixed CPU+GPU targets in a user-supplied
-    device_map dict. Meta values are passed through (validated at boot against
-    load_weights)."""
+    """Reject mixed CPU/disk + GPU targets in a user-supplied device_map dict.
+    All-CPU and all-disk-or-CPU maps are accepted (GeneralizedComponent.__call__
+    wraps forward in Accelerate's align_module_device, so components reading raw
+    params directly still see materialized data, verified on CPU-only hardware).
+    Meta values are passed through (validated at boot against load_weights)."""
     if isinstance(device_map, str):
         return
-    for key, value in device_map.items():
-        normalized = str(value).lower() if isinstance(value, str) else None
-        if normalized in _UNSUPPORTED_OFFLOAD_DEVICE_MAP_VALUES:
-            raise ValueError(
-                f"device_map[{key!r}]={value!r} is not supported yet. TransformerBridge "
-                "currently supports CPU device_map targets, but disk / meta offload can "
-                "bypass Accelerate hooks inside wrapped Bridge components."
-            )
-    if is_mixed_cpu_gpu(device_map.values()):
-        raise ValueError(MIXED_CPU_GPU_ERROR)
+    if is_mixed_offload_gpu(device_map.values()):
+        raise ValueError(MIXED_OFFLOAD_GPU_ERROR)
 
 
-# In a mixed map, accelerate OFFLOADS the CPU entries: weights live in a CPU state
-# dict, the modules hold meta placeholders, and an AlignDevicesHook on the original
-# module's forward materializes them per-call. Bridge components that compute from raw
-# parameters (e.g. NormalizationBridge reads self.weight to expose hook_normalized)
-# never trigger that hook, so the forward hits meta tensors. All-CPU maps are fine —
-# no offload, real parameters.
-MIXED_CPU_GPU_ERROR = (
-    "device_map mixes CPU and GPU targets, which accelerate implements as CPU offload "
-    "(meta placeholders materialized by forward hooks that Bridge components bypass). "
-    "Use an all-GPU map (or n_devices) for multi-GPU, or an all-CPU map."
+# In a mixed map, accelerate OFFLOADS the CPU/disk entries: weights live in a CPU
+# state dict or on disk, the modules hold meta placeholders, and an AlignDevicesHook
+# on the original module's forward materializes them per-call.
+# GeneralizedComponent.__call__ wraps every component call in that same hook, so this
+# is likely fine in principle — but it's only been verified on CPU-only hardware (no
+# GPU to mix in), so a map that actually puts some weights on a GPU stays rejected
+# until that's confirmed. All-CPU, all-disk, or CPU+disk maps are fine — no GPU
+# involved, so nothing to leave unverified.
+MIXED_OFFLOAD_GPU_ERROR = (
+    "device_map mixes CPU/disk offload targets with a GPU target. This is likely fine "
+    "(GeneralizedComponent.__call__ materializes offloaded params for every component "
+    "call), but has only been verified on CPU-only hardware — no GPU to mix in. Use an "
+    "all-GPU map (or n_devices) for multi-GPU, or an all-CPU/all-disk map."
 )
 
 
-def is_mixed_cpu_gpu(values: Any) -> bool:
-    has_cpu = has_gpu = False
+def is_mixed_offload_gpu(values: Any) -> bool:
+    has_offload = has_gpu = False
     for value in values:
         if isinstance(value, int):
             has_gpu = True
         elif isinstance(value, str):
             v = value.lower()
-            if v == "cpu":
-                has_cpu = True
+            if v in ("cpu", "disk"):
+                has_offload = True
             elif v.startswith("cuda"):
                 has_gpu = True
-    return has_cpu and has_gpu
+    return has_offload and has_gpu
 
 
 def cast_floating_params_to_dtype(model: nn.Module, dtype: torch.dtype) -> None:
-    """Cast materialized floating parameters while preserving Accelerate offload hooks."""
+    """Cast materialized floating parameters while preserving Accelerate offload hooks.
+
+    Only safe on a model with no active quantizer; go through
+    ``maybe_cast_floating_params`` for anything that came out of ``from_pretrained``.
+
+    The one-byte-float skip below is a backstop against the worst corruption, not an
+    ownership test. Quantizer-owned scales are float32 as often as FP8: transformers'
+    finegrained-FP8 stores ``weight_scale_inv`` as float32 unless the checkpoint asks
+    for ue8m0 scales, and fbgemm-FP8 stores its scales as float32 outright. A dtype
+    cannot say who owns a tensor.
+    See: https://github.com/TransformerLensOrg/TransformerLens/issues/1743
+    """
     from accelerate.utils import align_module_device
 
     for module in model.modules():
@@ -259,7 +270,38 @@ def cast_floating_params_to_dtype(model: nn.Module, dtype: torch.dtype) -> None:
                     continue
                 if param.device.type == "meta":
                     continue
+                # Backstop, not an ownership test. One-byte floats are the case
+                # where a cast is silently unrecoverable, so they are refused even
+                # here; wider quantizer-owned scales exist and are NOT caught, which
+                # is why callers gate on the model's quantizer instead of on dtype.
+                if param.dtype.itemsize < 2:
+                    continue
                 param.data = param.data.to(dtype=dtype)
+
+
+def maybe_cast_floating_params(model: nn.Module, dtype: torch.dtype) -> None:
+    """Cast floating params to dtype, skipping models with active quantization.
+
+    The skip is whole-model on purpose. ``from_pretrained`` has already settled the
+    load dtype by this point, and on a quantized checkpoint that is the quantizer's
+    *effective* dtype, not necessarily the requested one: quantizers may override it
+    in ``HfQuantizer.update_dtype`` (AWQ downgrades bfloat16 to float16 whenever CUDA
+    or XPU is available, whatever the placement; fbgemm-FP8 and FP-Quant force
+    bfloat16). Re-casting here would overwrite those
+    deliberate choices along with genuinely quantizer-owned storage, and dtype alone
+    cannot tell the two apart.
+
+    The gate releases in step with HF: a dequantized load has its
+    ``quantization_config`` deleted by ``HfQuantizer.remove_quantization_config``, so
+    ``quantization_method`` returns None and normalization resumes.
+
+    See: https://github.com/TransformerLensOrg/TransformerLens/issues/1713
+    See: https://github.com/TransformerLensOrg/TransformerLens/issues/1743
+    """
+    from transformer_lens.utilities.quantization import quantization_method
+
+    if quantization_method(getattr(model, "config", None)) is None:
+        cast_floating_params_to_dtype(model, dtype)
 
 
 def find_embedding_device(hf_model: Any) -> Optional[torch.device]:

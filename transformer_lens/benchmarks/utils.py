@@ -64,12 +64,10 @@ BRIDGE_EXPECTED_MISSING_PATTERNS = [
     "attn.hook_attn_scores",
     "attn.hook_pattern",
     # MoE per-expert hooks: Bridge uses HF's batched MoE forward pass via MoEBridge,
-    # which wraps the entire MoE module. HookedTransformer creates individual expert
+    # which wraps the entire MoE module. The legacy reference created individual expert
     # modules with per-expert hooks (e.g., blocks.0.mlp.experts.3.hook_pre).
     "mlp.experts.",
     "mlp.hook_experts",
-    "mlp.hook_expert_indices",
-    "mlp.hook_expert_weights",
     # Parallel attention+MLP architectures (GPT-J, GPT-NeoX): HF has a single
     # shared layer norm (ln_1), while HT creates a virtual ln2 that shares weights
     # with ln1. The Bridge only wraps the actual HF ln_1, so ln2 hooks don't exist.
@@ -459,3 +457,13 @@ def format_results(results: List[BenchmarkResult]) -> str:
     output.append("=" * 80)
 
     return "\n".join(output)
+
+
+def bridge_self_target_loss(bridge, test_text: str):
+    """Loss with the tokenized input as explicit labels.
+
+    Seq2seq bridges refuse label-less return_type="loss" (encoder input_ids are
+    not decoder targets), so every benchmark loss call routes through here.
+    """
+    labels = bridge.to_tokens(test_text)
+    return bridge(test_text, labels=labels, return_type="loss")

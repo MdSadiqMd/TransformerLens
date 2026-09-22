@@ -124,6 +124,7 @@ class _LLaDAAttentionBridge(AttentionBridge):
         attn_scores = self.hook_attn_scores(attn_scores)
 
         pattern = torch.nn.functional.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q.dtype)
+        pattern = self._scrub_compatibility_pattern_nans(pattern)
         dropout = float(getattr(block.config, "attention_dropout", 0.0))
         if block.training and dropout > 0.0:
             pattern = torch.nn.functional.dropout(pattern, p=dropout, training=True)
@@ -221,6 +222,10 @@ class _LLaDABlockBridge(BlockBridge):
 
 class _LLaDAGatedMLPBridge(GatedMLPBridge):
     """Executable view over LLaDA's block-local gated MLP projections."""
+
+    # The block calls this view's forward, which fires hook_in/hook_out itself;
+    # the setup-time mirror would double-apply interventions.
+    mirror_placeholder_hooks = False
 
     def set_original_component(self, original_component: torch.nn.Module) -> None:
         """The executable view needs the block's children, not ownership of the block."""

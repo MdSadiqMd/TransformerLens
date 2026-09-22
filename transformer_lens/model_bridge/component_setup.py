@@ -20,6 +20,63 @@ if TYPE_CHECKING:
     pass
 
 
+class _ContainerStateOwner(nn.Module):
+    """Registered view of state owned directly by an unwrapped container."""
+
+    def __init__(self, original_container: nn.Module) -> None:
+        super().__init__()
+        self.__dict__["_original_container"] = original_container
+
+    def _sync_original_container(self) -> None:
+        original_container = self.__dict__["_original_container"]
+        original_container._parameters.update(self._parameters)
+        original_container._buffers.update(self._buffers)
+
+    def _refresh_from_original_container(self) -> None:
+        original_container = self.__dict__["_original_container"]
+        for name in self._parameters:
+            self._parameters[name] = original_container._parameters[name]
+        for name in self._buffers:
+            self._buffers[name] = original_container._buffers[name]
+
+    def _apply(self, fn: Any, recurse: bool = True) -> "_ContainerStateOwner":
+        self._refresh_from_original_container()
+        super()._apply(fn, recurse=recurse)
+        self._sync_original_container()
+        return self
+
+    def _load_from_state_dict(
+        self,
+        state_dict: dict[str, Any],
+        prefix: str,
+        local_metadata: dict[str, Any],
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        self._sync_original_container()
+
+
+def refresh_container_state_owners(bridge_module: nn.Module) -> None:
+    """Refresh registered container state from the original model tree."""
+    root_owner = bridge_module._modules.get("_container_state_owners")
+    if not isinstance(root_owner, _ContainerStateOwner):
+        return
+    for owner in root_owner.modules():
+        if isinstance(owner, _ContainerStateOwner):
+            owner._refresh_from_original_container()
+
+
 def replace_remote_component(
     replacement_component: nn.Module, remote_path: str, remote_model: RemoteModel
 ) -> None:
@@ -56,6 +113,92 @@ def set_original_components(
     """
     component_mapping = architecture_adapter.get_component_mapping()
     setup_components(component_mapping, bridge_module, architecture_adapter, original_model)
+    if isinstance(original_model, nn.Module):
+        _register_unowned_container_state(bridge_module, original_model)
+
+
+def _register_unowned_container_state(bridge_module: nn.Module, original_model: nn.Module) -> None:
+    """Make direct container parameters and buffers reachable through the Bridge tree."""
+    registered_parameter_ids = {
+        id(parameter)
+        for module in bridge_module.modules()
+        for parameter in module._parameters.values()
+        if parameter is not None
+    }
+    registered_buffer_ids = {
+        id(buffer)
+        for module in bridge_module.modules()
+        for buffer in module._buffers.values()
+        if buffer is not None
+    }
+    missing_parameters: list[tuple[str, nn.Module, str, nn.Parameter]] = []
+    missing_buffers: list[tuple[str, nn.Module, str, Any]] = []
+
+    for module_path, module in original_model.named_modules():
+        if any(child is not None for child in module._modules.values()):
+            for parameter_name, parameter in module._parameters.items():
+                if parameter is not None and id(parameter) not in registered_parameter_ids:
+                    missing_parameters.append((module_path, module, parameter_name, parameter))
+                    registered_parameter_ids.add(id(parameter))
+        for buffer_name, buffer in module._buffers.items():
+            if buffer is not None and id(buffer) not in registered_buffer_ids:
+                missing_buffers.append((module_path, module, buffer_name, buffer))
+                registered_buffer_ids.add(id(buffer))
+
+    if not missing_parameters and not missing_buffers:
+        return
+
+    owner_by_path: dict[str, _ContainerStateOwner] = {"": _ContainerStateOwner(original_model)}
+    root_owner = owner_by_path[""]
+    original_modules = dict(original_model.named_modules())
+
+    def get_owner(module_path: str) -> _ContainerStateOwner:
+        current_path = ""
+        current_owner = root_owner
+        for path_part in module_path.split(".") if module_path else ():
+            child_path = f"{current_path}.{path_part}" if current_path else path_part
+            if child_path not in owner_by_path:
+                child_owner = _ContainerStateOwner(original_modules[child_path])
+                current_owner.add_module(path_part, child_owner)
+                owner_by_path[child_path] = child_owner
+            current_owner = owner_by_path[child_path]
+            current_path = child_path
+        return current_owner
+
+    for module_path, _, parameter_name, parameter in missing_parameters:
+        get_owner(module_path).register_parameter(parameter_name, parameter)
+
+    for module_path, module, buffer_name, buffer in missing_buffers:
+        get_owner(module_path).register_buffer(
+            buffer_name,
+            buffer,
+            persistent=buffer_name not in module._non_persistent_buffers_set,
+        )
+
+    bridge_module.add_module("_container_state_owners", root_owner)
+
+
+def _wire_symbolic_hooks(symbolic: GeneralizedComponent) -> None:
+    """Fire a placeholder's own hook_in/hook_out from its ``in``/``out`` subcomponents.
+
+    Applies to SymbolicBridge and to containerless bridges (``name=None``, e.g.
+    OPT/XGLM's fc-split MLPBridge): neither has a forward in the execution path,
+    so their own HookPoints would otherwise never fire. Permanent hooks (survive
+    reset_hooks) re-fire the subcomponent activation through the placeholder's
+    HookPoint, so ``blocks.{i}.mlp.hook_in/hook_out`` (and their compat aliases)
+    behave like every non-symbolic arch's. A hook that returns a modified tensor
+    on the placeholder point propagates: the mirror returns it into the
+    subcomponent's chain.
+    """
+    if getattr(symbolic, "_placeholder_hooks_wired", False):
+        return
+    sub_in = symbolic.submodules.get("in")
+    sub_out = symbolic.submodules.get("out")
+    if sub_in is not None:
+        sub_in.hook_in.add_hook(lambda tensor, hook: symbolic.hook_in(tensor), is_permanent=True)
+    if sub_out is not None:
+        sub_out.hook_out.add_hook(lambda tensor, hook: symbolic.hook_out(tensor), is_permanent=True)
+    object.__setattr__(symbolic, "_placeholder_hooks_wired", True)
 
 
 def setup_submodules(
@@ -92,6 +235,13 @@ def setup_submodules(
             for sub_name, (sub_path, sub_comp) in submodule.real_components.items():
                 prefixed_key = f"{module_name}.{sub_name}"
                 component.real_components[prefixed_key] = (sub_path, sub_comp)
+
+            # The placeholder has no forward, so its own hook_in/hook_out would never
+            # fire — mirror them from the designated subcomponents (fc-split archs:
+            # mlp.hook_in = fc1's input, mlp.hook_out = fc2's output). Firing through
+            # the parent HookPoint keeps caching AND interventions working: the return
+            # value feeds back into the subcomponent's hook chain.
+            _wire_symbolic_hooks(submodule)
         else:
             # Set up original_component if not already set
             if submodule.original_component is None:
@@ -144,6 +294,12 @@ def setup_submodules(
                 for sub_name, (sub_path, sub_comp) in submodule.real_components.items():
                     prefixed_key = f"{module_name}.{sub_name}"
                     component.real_components[prefixed_key] = (sub_path, sub_comp)
+                # And like SymbolicBridge, nothing in the execution path calls
+                # their forward, so mirror hook_in/hook_out from in/out.
+                # Opt-in flag: executable containerless views (LLaDA's gated
+                # MLP) fire their own hooks and must not be double-fired.
+                if getattr(submodule, "mirror_placeholder_hooks", False):
+                    _wire_symbolic_hooks(submodule)
             elif not submodule.is_list_item:
                 component.real_components[module_name] = (submodule.name, submodule)
 
@@ -286,6 +442,8 @@ def setup_blocks_bridge(
         block_bridge.name = f"{blocks_template.name}.{i}"
         block_bridge.set_original_component(original_block)
         setup_submodules(block_bridge, architecture_adapter, original_block)
+        if hasattr(block_bridge, "_wire_ln1_module"):
+            block_bridge._wire_ln1_module()
         bridged_blocks.append(block_bridge)
     replace_remote_component(bridged_blocks, blocks_template.name, original_model)
     return bridged_blocks

@@ -12,6 +12,7 @@ from transformer_lens.conversion_utils.param_processing_conversion import (
 from transformer_lens.model_bridge.architecture_adapter import ArchitectureAdapter
 from transformer_lens.model_bridge.generalized_components import (
     AttentionBridge,
+    BertPoolerBridge,
     BlockBridge,
     EmbeddingBridge,
     LinearBridge,
@@ -87,7 +88,13 @@ class BertArchitectureAdapter(ArchitectureAdapter):
         # MLM defaults; prepare_model() adjusts for other task heads (e.g., NSP).
         self.component_mapping = {
             "embed": EmbeddingBridge(name="bert.embeddings.word_embeddings"),
+            "token_type_embed": EmbeddingBridge(name="bert.embeddings.token_type_embeddings"),
             "pos_embed": PosEmbedBridge(name="bert.embeddings.position_embeddings"),
+            "embed_ln": NormalizationBridge(
+                name="bert.embeddings.LayerNorm",
+                config=self.cfg,
+                use_native_layernorm_autograd=True,
+            ),
             "blocks": BlockBridge(
                 name="bert.encoder.layer",
                 # BERT has no single MLP module (intermediate.dense and output.dense
@@ -129,6 +136,7 @@ class BertArchitectureAdapter(ArchitectureAdapter):
                     ),
                 },
             ),
+            "mlm_head": LinearBridge(name="cls.predictions.transform.dense"),
             "unembed": UnembeddingBridge(name="cls.predictions.decoder"),
             "ln_final": NormalizationBridge(
                 name="cls.predictions.transform.LayerNorm",
@@ -144,7 +152,22 @@ class BertArchitectureAdapter(ArchitectureAdapter):
         BertForNextSentencePrediction has cls.seq_relationship (NSP head)
         and no MLM-specific LayerNorm.
         """
-        if hasattr(hf_model, "cls") and hasattr(hf_model.cls, "seq_relationship"):
-            # NSP model — swap head components
+        if getattr(getattr(hf_model, "bert", None), "pooler", None) is not None:
+            # Wrap the pooler itself, not its inner Linear: HF applies tanh after
+            # the projection, so hook_out here is the pooled [CLS] that
+            # HookedEncoder's BertPooler exposes as hook_pooler_out. The dense
+            # stays hookable as a submodule for the pre-activation projection.
+            self.components["pooler"] = BertPoolerBridge(
+                name="bert.pooler",
+                submodules={"dense": LinearBridge(name="dense")},
+            )
+
+        has_predictions = hasattr(getattr(hf_model, "cls", None), "predictions")
+        has_nsp_head = hasattr(getattr(hf_model, "cls", None), "seq_relationship")
+        if has_nsp_head and has_predictions:
+            self.components["nsp_head"] = LinearBridge(name="cls.seq_relationship")
+        elif has_nsp_head:
+            # NSP-only model — swap head components.
             self.components["unembed"] = UnembeddingBridge(name="cls.seq_relationship")
+            self.components.pop("mlm_head", None)
             self.components.pop("ln_final", None)

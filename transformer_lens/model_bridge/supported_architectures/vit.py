@@ -57,8 +57,8 @@ class ViTArchitectureAdapter(ArchitectureAdapter):
     supports_generation: bool = False
 
     # Vision models have no tokenizer, so of the text phases only Phase 1 (HF
-    # parity on pixel input) applies — Phases 2/3 need a HookedTransformer
-    # counterpart and Phase 4 needs text generation. Phase 9 (vision hook/cache
+    # parity on pixel input) applies — Phases 2/3 compare text logits/loss and
+    # Phase 4 needs text generation. Phase 9 (vision hook/cache
     # tests) is gated by is_visual_model, not this list; _full_and_core_phases()
     # routes "vision" architectures to {1, 9}.
     applicable_phases: list[int] = [1]
@@ -204,3 +204,5 @@ class ViTArchitectureAdapter(ArchitectureAdapter):
         self.component_mapping = self._build_component_mapping(
             prefix=prefix, with_classifier=with_classifier
         )
+        if not with_classifier and getattr(hf_model, "pooler", None) is not None:
+            self.component_mapping["pooler"] = LinearBridge(name="pooler.dense")

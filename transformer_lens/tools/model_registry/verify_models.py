@@ -35,6 +35,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from transformer_lens.benchmarks.text_quality_profiles import (
+    P4_SCORING_VERSION,
+    p4_pass_threshold,
+)
 from transformer_lens.utilities.heterogeneous_config import het_safe_view
 
 # Exit code used for graceful interrupts (Ctrl+C).  The wrapper script
@@ -45,38 +49,26 @@ _EXIT_GRACEFUL_INTERRUPT = 42
 # between models without corrupting state.
 _interrupt_requested = False
 
+from . import REMOTE_CODE_MODEL_PREFIXES
 from .registry_io import (
+    MODALITY_PHASES,
     QUANTIZED_NOTE,
     STATUS_FAILED,
     STATUS_PROVISIONAL,
     STATUS_SKIPPED,
     STATUS_UNVERIFIED,
     STATUS_VERIFIED,
+    TEXT_PHASES,
     add_verification_record,
+    extract_phase_scores,
     is_incompatible_quantized,
     load_supported_models_raw,
+    pass_status,
     required_quant_library_for_model,
     update_model_status,
 )
 
 logger = logging.getLogger(__name__)
-
-# Architectures added via the TransformerBridge system that need trust_remote_code=True.
-# These are not in the legacy NEED_REMOTE_CODE_MODELS tuple (loading_from_pretrained.py).
-_BRIDGE_REMOTE_CODE_PREFIXES: tuple[str, ...] = (
-    "baichuan-inc/",  # BaichuanForCausalLM — ships own modeling_baichuan.py
-    "ByteDance/Ouro-",  # OuroForCausalLM — ships own modeling_ouro.py
-    "internlm/",  # InternLM2ForCausalLM — ships own modeling_internlm2.py
-    "GSAI-ML/LLaDA",  # LLaDAModelLM — ships configuration_llada.py/modeling_llada.py
-    "kuleshov-group/",  # BD3LM — ships own custom modeling_d_dit.py
-    "Dream-org/",  # DreamModel — ships own modeling_dream.py
-    "dvruette/",  # GiddForDiffusionLM — ships own modeling_gidd.py
-    "LongSafari/",  # HyenaDNAForCausalLM — ships own modeling_hyena.py
-    "inclusionAI/",  # LLaDA2MoeModelLM — ships own modeling_llada2_moe.py
-    "poolside/",  # LagunaForCausalLM — ships own modeling_laguna.py
-    "apple/DiffuCoder",  # DreamModel (DiffuCoder) — same remote code family
-    "LGAI-EXAONE/",  # ExaoneForCausalLM (EXAONE-3.x) — ships own modeling_exaone.py
-)
 
 # Data directory for registry files
 _DATA_DIR = Path(__file__).parent / "data"
@@ -126,16 +118,17 @@ def _phases_to_run(arch: str, phases: list[int]) -> list[int]:
     """Restrict requested phases to those the adapter supports.
 
     An adapter's ``applicable_phases`` declares which text phases (1-4) it covers. Phases
-    7/8/9 are gated separately by ``is_multimodal``/``is_audio_model``/``is_visual_model``
-    in the benchmark, so they are never filtered out here. An empty result means none of
-    the requested phases apply to this architecture (SSM / recurrent families run all four).
+    7/8/9 are gated separately by ``is_multimodal``/``is_audio``/``is_visual_model`` in
+    ``main_benchmark._phase_enabled`` (the mirror of this gate), so they are never filtered
+    out here. An empty result means none of the requested phases apply to this architecture
+    (SSM / recurrent families run all four).
     """
     from transformer_lens.factories.architecture_adapter_factory import (
         SUPPORTED_ARCHITECTURES,
     )
 
-    applicable = getattr(SUPPORTED_ARCHITECTURES.get(arch), "applicable_phases", [1, 2, 3, 4])
-    return [p for p in phases if p in applicable or p in (7, 8, 9)]
+    applicable = getattr(SUPPORTED_ARCHITECTURES.get(arch), "applicable_phases", list(TEXT_PHASES))
+    return [p for p in phases if p in applicable or p in MODALITY_PHASES]
 
 
 def _full_and_core_phases(arch: str) -> tuple[set[int], set[int]]:
@@ -147,8 +140,8 @@ def _full_and_core_phases(arch: str) -> tuple[set[int], set[int]]:
     if kind == "audio":
         return {1, 8}, {1, 8}
     if kind == "vision":
-        # Vision encoders have no tokenizer and no text tower: Phases 2/3 need
-        # HookedTransformer, Phase 4 needs text generation, and Phase 7 covers
+        # Vision encoders have no tokenizer and no text tower: Phases 2/3 compare
+        # text logits/loss, Phase 4 needs text generation, and Phase 7 covers
         # vision+text multimodal models, not these. Phase 1 (HF parity) plus
         # Phase 9 (pixel forward/cache/stability) are the whole story.
         return {1, 9}, {1, 9}
@@ -164,12 +157,6 @@ def _full_and_core_phases(arch: str) -> tuple[set[int], set[int]]:
 def _default_phases_for_architecture(arch: str) -> list[int]:
     """Phases to run when the caller names none — a full verification."""
     return sorted(_full_and_core_phases(arch)[0])
-
-
-def _pass_status(use_hf_reference: bool) -> int:
-    """Status for a passing run: VERIFIED with an HF reference, else PROVISIONAL
-    (a --no-hf-reference structural-only pass is recorded but not counted verified)."""
-    return STATUS_VERIFIED if use_hf_reference else STATUS_PROVISIONAL
 
 
 def _get_current_model_status(model_id: str, arch_id: str) -> int:
@@ -230,26 +217,50 @@ class VerificationProgress:
         )
 
 
-def estimate_model_params(model_id: str) -> int:
-    """Estimate parameter count using AutoConfig (lightweight, no model download).
+def published_param_count(model_id: str) -> Optional[int]:
+    """Exact parameter count from the hub's safetensors metadata, or None.
 
-    Fetches only the config JSON (~KB) and computes n_params from dimensions
-    using the same formula as HookedTransformerConfig.__post_init__.
+    Metadata only -- no weights are fetched. Preferred over the config formula
+    below, which assumes every layer carries full attention and an MLP and so
+    over-counts a hybrid Mamba/attention stack roughly fourfold
+    (NVIDIA-Nemotron-Nano-9B-v2: 36.6B estimated against 8.89B published, enough
+    to skip the model as too large for memory it does not need).
+    """
+    from transformer_lens.utilities.hf_utils import get_hf_token
+
+    try:
+        from huggingface_hub import HfApi
+
+        info = HfApi().model_info(model_id, expand=["safetensors"], token=get_hf_token())
+    except Exception:
+        # Unpublished metadata, a gated repo or a network blip: fall back rather
+        # than fail, since the config formula needs no hub metadata.
+        return None
+    total = getattr(info.safetensors, "total", None) if info.safetensors else None
+    return int(total) if total else None
+
+
+def estimate_model_params(model_id: str) -> int:
+    """Parameter count for this model: published metadata first, else a config estimate.
+
+    Fetches only metadata and the config JSON (~KB), never weights.
 
     Args:
         model_id: HuggingFace model ID
 
     Returns:
-        Estimated number of parameters
+        Number of parameters — exact when the hub publishes it, else estimated
+        from config dimensions using the standard TransformerLens
+        parameter-count formula.
 
     Raises:
         Exception: If config cannot be fetched or parsed
     """
+    published = published_param_count(model_id)
+    if published:
+        return published
 
-    from transformer_lens.loading_from_pretrained import NEED_REMOTE_CODE_MODELS
-
-    _all_remote_prefixes = NEED_REMOTE_CODE_MODELS + _BRIDGE_REMOTE_CODE_PREFIXES
-    trust_remote_code = any(model_id.startswith(prefix) for prefix in _all_remote_prefixes)
+    trust_remote_code = any(model_id.startswith(prefix) for prefix in REMOTE_CODE_MODEL_PREFIXES)
     from transformer_lens.utilities.hf_utils import (
         autoconfig_with_remote_post_init_compat,
         get_hf_token,
@@ -383,7 +394,7 @@ def estimate_model_params(model_id: str) -> int:
             n_params -= n_layers * (d_model * d_mlp * mlp_multiplier)
             n_params += n_layers * moe_per_layer
 
-    # Embedding parameters (not in HookedTransformerConfig formula but relevant for memory)
+    # Embedding parameters (not in the block-param formula but relevant for memory)
     n_params += d_vocab * d_model
 
     return n_params
@@ -394,6 +405,7 @@ def estimate_benchmark_memory_gb(
     dtype: str = "float32",
     phases: Optional[list[int]] = None,
     use_hf_reference: bool = True,
+    device: str = "cpu",
 ) -> float:
     """Estimate peak memory needed for benchmark suite.
 
@@ -402,8 +414,8 @@ def estimate_benchmark_memory_gb(
 
     Phase 1 (HF ref on):  HF ref + Bridge → 2.0x peak
     Phase 1 (HF ref off): Bridge only     → 1.0x peak
-    Phase 2: Bridge + HookedTransformer (separate copy) → 2.0x model + overhead
-    Phase 3: Same as Phase 2 (processed versions) → 2.0x model + overhead
+    Phase 2: Bridge only (runtime self-checks) → 1.0x model + overhead
+    Phase 3: Bridge + weight-processing state-dict transient → 2.0x model + overhead
     Phase 4: Bridge + GPT-2 scorer (~500MB) → ~1.0x model + 0.5 GB
 
     Args:
@@ -420,8 +432,12 @@ def estimate_benchmark_memory_gb(
     bpp = bytes_per_param.get(dtype, 4)
     model_size_gb = n_params * bpp / (1024**3)
 
-    # GPT-2 scorer overhead (loaded during Phase 4)
-    gpt2_overhead_gb = 0.5
+    # Phase-4 judge overhead: measured 2.33 GB RSS loading Qwen2.5-0.5B fp32
+    # on CPU (494M params). Kept slightly above the measurement; over-counting
+    # is the safe direction.
+    # The CPU-pinned judge never occupies accelerator memory; charging it to
+    # a cuda budget produces spurious VRAM skips.
+    judge_overhead_gb = 2.5 if device == "cpu" else 0.0
 
     # Activation/framework overhead as a fraction of model size
     overhead_fraction = 0.2
@@ -430,19 +446,22 @@ def estimate_benchmark_memory_gb(
     phase_peaks = []
 
     if phases is None:
-        phases = [1, 2, 3, 4]
+        phases = list(TEXT_PHASES)
 
     for p in phases:
         if p == 1:
             # HF ref + Bridge (2 copies) or Bridge alone
             multiplier = 2.0 if use_hf_reference else 1.0
             phase_peaks.append(model_size_gb * multiplier * (1 + overhead_fraction))
-        elif p in (2, 3):
-            # Bridge + HookedTransformer = 2 copies
+        elif p == 2:
+            # Bridge only (runtime self-checks + saved-HF equivalence)
+            phase_peaks.append(model_size_gb * 1.0 * (1 + overhead_fraction))
+        elif p == 3:
+            # Bridge + the full state-dict copy materialized during weight processing
             phase_peaks.append(model_size_gb * 2.0 * (1 + overhead_fraction))
         elif p == 4:
-            # Bridge + GPT-2 scorer
-            phase_peaks.append(model_size_gb * (1 + overhead_fraction) + gpt2_overhead_gb)
+            # Bridge + judge
+            phase_peaks.append(model_size_gb * (1 + overhead_fraction) + judge_overhead_gb)
 
     return max(phase_peaks) if phase_peaks else model_size_gb
 
@@ -559,40 +578,21 @@ def select_models_for_verification(
     return candidates
 
 
-def _extract_phase_scores(results: list) -> dict[int, Optional[float]]:
-    """Extract phase scores from benchmark results.
+# Phase-score extraction and pass-status logic live in registry_io
+# (extract_phase_scores / pass_status) — the shared home for both
+# registry-writing paths, this module and main_benchmark.update_model_registry.
 
-    Mirrors the logic in update_model_registry() from main_benchmark.py.
 
-    Args:
-        results: List of BenchmarkResult objects
-
-    Returns:
-        Dict mapping phase number to score (0-100) or None
-    """
-    from transformer_lens.benchmarks.utils import BenchmarkSeverity
-
-    phase_results: dict[int, list[bool]] = {1: [], 2: [], 3: [], 4: [], 7: [], 8: [], 9: []}
+def _extract_prompt_profile(results: list) -> Optional[str]:
+    """Effective Phase-4 prompt profile from the benchmark details, or None
+    when no Phase-4 result exists. The default "continuation" is reported so
+    the registry write can clear a stale non-default key."""
     for result in results:
-        if result.phase in phase_results and result.severity != BenchmarkSeverity.SKIPPED:
-            phase_results[result.phase].append(result.passed)
-
-    scores: dict[int, Optional[float]] = {}
-    for phase, passed_list in phase_results.items():
-        if passed_list:
-            scores[phase] = round(sum(passed_list) / len(passed_list) * 100, 1)
-        # Omit phases with no results — they weren't run, so their
-        # existing registry scores should be preserved.
-
-    # Phase 4 (text quality): store the actual 0-100 quality score from the
-    # benchmark details instead of a binary pass/fail percentage.
-    if 4 in scores:
-        for result in results:
-            if result.phase == 4 and result.details and "score" in result.details:
-                scores[4] = round(result.details["score"], 1)
-                break
-
-    return scores
+        if result.phase == 4 and result.details:
+            profile = result.details.get("prompt_profile")
+            if isinstance(profile, str):
+                return profile
+    return None
 
 
 # Per-phase minimum score thresholds (0-100).
@@ -604,22 +604,16 @@ _MIN_PHASE_SCORES: dict[int, float] = {
     1: 100.0,
     2: 75.0,
     3: 75.0,
-    4: 50.0,
+    # Phase 4 floor == the benchmark pass line; a gap between them lets a
+    # failing score carry a clean "completed" note.
+    4: p4_pass_threshold(),
     7: 75.0,
     8: 75.0,
     9: 75.0,
 }
 _DEFAULT_MIN_PHASE_SCORE = 50.0
 
-# Architectures that include a vision encoder and require Phase 7 (multimodal
-# benchmarks) as part of core verification.
 from transformer_lens.utilities.architectures import classify_architecture
-
-_AUDIO_ARCHITECTURES = {
-    "HubertForCTC",
-    "HubertModel",
-    "HubertForSequenceClassification",
-}
 
 # Tests that MUST pass for a phase to be considered passing, regardless of
 # the overall percentage score.  If any required test fails, the phase fails
@@ -639,6 +633,18 @@ _MODALITY_NULL_MESSAGES: dict[int, str] = {
     8: "P8=NULL (audio tests skipped — no results)",
     9: "P9=NULL (vision tests skipped — no results)",
 }
+
+
+def _measured_nothing(phase_scores: dict) -> bool:
+    """True when no phase produced a score, so the run verified nothing.
+
+    An adapter's ``applicable_phases`` can prune the requested phases to empty.
+    That leaves ``required_phases`` empty as well, so no score check fires and a
+    run that measured nothing would otherwise be recorded as VERIFIED.
+
+    ``is not None`` rather than truthiness: 0.0 is a real score.
+    """
+    return not any(score is not None for score in phase_scores.values())
 
 
 def _check_phase_scores(
@@ -678,9 +684,9 @@ def _check_phase_scores(
 
     for phase, score in sorted(phase_scores.items()):
         if score is None:
-            # Phase 7 (multimodal), Phase 8 (audio), or 9 (vision) with a NULL score means
-            # the modality tests never ran.  This is a verification failure,
-            # not something to silently skip.
+            # Phase 7 (multimodal), 8 (audio), or 9 (vision) with a NULL score
+            # means the modality tests never ran.  This is a verification
+            # failure, not something to silently skip.
             if phase in _MODALITY_NULL_MESSAGES:
                 failing_phases.append(_MODALITY_NULL_MESSAGES[phase])
             continue
@@ -760,15 +766,89 @@ def _build_verified_note(
             else:
                 issue_parts.append(f"P{phase}={score}%")
 
+    p4_uncovered = next(
+        (
+            r.message
+            for r in all_results
+            if r.phase == 4
+            and r.severity == BenchmarkSeverity.SKIPPED
+            and r.message.startswith("P4 skipped:")
+        ),
+        None,
+    )
+    suffix = ""
+    if p4_uncovered:
+        # Keep the gap visible in the registry until prompt coverage is added.
+        reason = p4_uncovered.split("—")[0].replace("P4 skipped:", "").strip()
+        suffix = f"; P4 skipped (uncovered: {reason} — file a coverage issue)"
+
     if issue_parts and low_text_quality:
         return (
             f"Full verification completed with issues, low text quality: {'; '.join(issue_parts)}"
+            + suffix
         )
     if issue_parts:
-        return f"Full verification completed with issues: {'; '.join(issue_parts)}"
+        return f"Full verification completed with issues: {'; '.join(issue_parts)}" + suffix
     if low_text_quality:
-        return "Full verification completed with issues, low text quality"
-    return "Full verification completed"
+        return "Full verification completed with issues, low text quality" + suffix
+    return "Full verification completed" + suffix
+
+
+def _preserved_issue_suffix(model_id: str, eff_phases) -> str:
+    """Sub-100 scores from phases not re-run this pass stay visible in the
+    note; a partial pass must not overwrite tracked residue."""
+    from transformer_lens.tools.model_registry.registry_io import (
+        load_supported_models_raw,
+    )
+
+    try:
+        entry = next(
+            (
+                m
+                for m in load_supported_models_raw().get("models", [])
+                if m.get("model_id") == model_id
+            ),
+            None,
+        )
+    except OSError:
+        return ""
+    if entry is None:
+        return ""
+    residue = []
+    for phase in (2, 3, 7, 8, 9):
+        if phase in (eff_phases or []):
+            continue
+        score = entry.get(f"phase{phase}_score")
+        if score is not None and score < 100.0:
+            residue.append(f"P{phase}={score}%")
+    if not residue:
+        return ""
+    return f" (prior issues retained: {', '.join(residue)})"
+
+
+def _p1_only_core_note(p4_score, all_results: list) -> str:
+    """Note for a core run where P1 passed but P4 did not contribute a pass.
+
+    A skipped P4 is a coverage gap, not a quality failure — the stale
+    (possibly old-scale) score must not be relabeled "poor"."""
+    from transformer_lens.benchmarks.utils import BenchmarkSeverity
+
+    p4_skip_msg = next(
+        (
+            r.message
+            for r in all_results
+            if r.phase == 4
+            and r.severity == BenchmarkSeverity.SKIPPED
+            and r.message.startswith("P4 skipped:")
+        ),
+        None,
+    )
+    if p4_skip_msg is not None:
+        reason = p4_skip_msg.split("—")[0].replace("P4 skipped:", "").strip()
+        return f"Core verification passed; P4 skipped ({reason})"
+    if p4_score is None:
+        return "Core verification passed, but text quality benchmark errored. Needs review"
+    return f"Core verification passed, but text quality poor (P4={p4_score}). Needs review"
 
 
 def _clear_hf_cache(quiet: bool = False) -> None:
@@ -779,8 +859,16 @@ def _clear_hf_cache(quiet: bool = False) -> None:
     if not cache_dir.exists():
         return
 
+    from transformer_lens.benchmarks.text_quality import JUDGE_MODEL_ID
+
+    # The pinned Phase-4 judge is needed by every run; deleting it here would
+    # force a re-download per family.
+    judge_dir = "models--" + JUDGE_MODEL_ID.replace("/", "--")
+
     freed = 0
     for blobs_dir in cache_dir.glob("models--*/blobs"):
+        if blobs_dir.parent.name == judge_dir:
+            continue
         for blob in blobs_dir.iterdir():
             try:
                 size = blob.stat().st_size
@@ -834,7 +922,6 @@ def verify_models(
     max_memory_gb: Optional[float] = None,
     dtype: str = "float32",
     use_hf_reference: bool = True,
-    use_ht_reference: bool = True,
     phases: Optional[list[int]] = None,
     quiet: bool = False,
     progress: Optional[VerificationProgress] = None,
@@ -847,7 +934,6 @@ def verify_models(
         max_memory_gb: Memory limit (auto-detected if None)
         dtype: Dtype for memory estimation
         use_hf_reference: Whether to compare against HuggingFace model
-        use_ht_reference: Whether to compare against HookedTransformer
         phases: Which benchmark phases to run
         quiet: Suppress verbose output
         progress: Existing progress for resume
@@ -867,21 +953,25 @@ def verify_models(
 
     # phases stays None = full verification for the model.
 
-    # Pre-load the GPT-2 scoring model for Phase 4 so it persists across all
-    # models in the batch instead of being loaded and destroyed for each one.
-    _scoring_model = None
-    _scoring_tokenizer = None
+    # Pre-load the Phase-4 judge so it persists across all models in the batch
+    # instead of being loaded and destroyed for each one.
+    _judge_model = None
+    _judge_tokenizer = None
     if phases is None or 4 in phases:
         try:
-            from transformer_lens.benchmarks.text_quality import _load_scoring_model
+            from transformer_lens.benchmarks.text_quality import (
+                JUDGE_MODEL_ID,
+                JUDGE_REVISION,
+                load_judge,
+            )
 
-            _scoring_model, _scoring_tokenizer = _load_scoring_model("gpt2", device)
+            _judge_model, _judge_tokenizer = load_judge()
             if not quiet:
-                print("Pre-loaded GPT-2 scoring model for Phase 4")
+                print(f"Pre-loaded Phase 4 judge {JUDGE_MODEL_ID}@{JUDGE_REVISION[:8]}")
         except Exception as e:
             if not quiet:
-                print(f"Warning: Could not pre-load GPT-2 scorer: {e}")
-                print("  Phase 4 will load its own scorer per model.")
+                print(f"Warning: Could not pre-load Phase 4 judge: {e}")
+                print("  Phase 4 will load its own judge per model.")
 
     total = len(candidates)
     for i, candidate in enumerate(candidates, 1):
@@ -932,7 +1022,7 @@ def verify_models(
         eff_phases = phases if phases is not None else _default_phases_for_architecture(arch)
         phases_to_run = _phases_to_run(arch, eff_phases)
         if adapter_cls is not None and not phases_to_run:
-            applicable = getattr(adapter_cls, "applicable_phases", [1, 2, 3, 4])
+            applicable = getattr(adapter_cls, "applicable_phases", list(TEXT_PHASES))
             note = (
                 f"Architecture {arch} has applicable_phases={applicable}; "
                 f"verify_models coverage is deferred. Verification lives "
@@ -953,7 +1043,7 @@ def verify_models(
 
         # Step 2: Check memory
         estimated_mem = estimate_benchmark_memory_gb(
-            n_params, dtype, phases=phases_to_run, use_hf_reference=use_hf_reference
+            n_params, dtype, phases=phases_to_run, use_hf_reference=use_hf_reference, device=device
         )
         candidate.estimated_memory_gb = estimated_mem
         if not quiet:
@@ -970,10 +1060,9 @@ def verify_models(
         all_results: list = []
         error_msg: Optional[str] = None
 
-        from transformer_lens.loading_from_pretrained import NEED_REMOTE_CODE_MODELS
-
-        _all_remote_prefixes = NEED_REMOTE_CODE_MODELS + _BRIDGE_REMOTE_CODE_PREFIXES
-        needs_remote_code = any(model_id.startswith(prefix) for prefix in _all_remote_prefixes)
+        needs_remote_code = any(
+            model_id.startswith(prefix) for prefix in REMOTE_CODE_MODEL_PREFIXES
+        )
 
         # Convert string dtype to torch.dtype for benchmark suite
         import torch
@@ -985,7 +1074,14 @@ def verify_models(
         }
         torch_dtype = _dtype_map[dtype]
 
+        from transformer_lens.benchmarks.text_quality_profiles import resolve_profile
+        from transformer_lens.tools.model_registry.registry_io import (
+            registry_prompt_profile,
+        )
+
+        resolved_profile = str(resolve_profile(model_id, arch, registry_prompt_profile(model_id)))
         if not quiet:
+            print(f"  Prompt profile: {resolved_profile}")
             print(f"  Running phases {phases} in a single benchmark call...")
         try:
             all_results = run_benchmark_suite(
@@ -993,19 +1089,19 @@ def verify_models(
                 device=device,
                 dtype=torch_dtype,
                 use_hf_reference=use_hf_reference,
-                use_ht_reference=use_ht_reference,
                 verbose=not quiet,
                 phases=phases_to_run,
                 trust_remote_code=needs_remote_code,
-                scoring_model=_scoring_model,
-                scoring_tokenizer=_scoring_tokenizer,
+                judge_model=_judge_model,
+                judge_tokenizer=_judge_tokenizer,
+                prompt_profile=resolved_profile,
             )
         except Exception as e:
             error_msg = str(e)
             if not quiet:
                 print(f"  Benchmark failed: {error_msg[:200]}")
 
-        phase_scores = _extract_phase_scores(all_results)
+        phase_scores = extract_phase_scores(all_results)
 
         if not error_msg:
             # Only require the core phases this run actually requested, so a
@@ -1041,8 +1137,10 @@ def verify_models(
         # only update the phase scores that were run.  Don't change the
         # model's overall status or note — those reflect the full
         # verification and should only be set by a complete run.
-        is_multimodal = classify_architecture(arch) == "multimodal"
-        is_audio = classify_architecture(arch) == "audio"
+        kind = classify_architecture(arch)
+        is_multimodal = kind == "multimodal"
+        is_audio = kind == "audio"
+        is_vision = kind == "vision"
         full_phases, core_required = _full_and_core_phases(arch)
         is_partial_run = set(eff_phases) != full_phases
 
@@ -1057,7 +1155,8 @@ def verify_models(
                     score_parts = [f"P{p}={s}%" for p, s in sorted(filtered_scores.items())]
                     print(f"  Partial phase update: {', '.join(score_parts)}")
 
-                # Core verification: P1+P4 for text-only, P1+P4+P7 for multimodal.
+                # Core verification: P1+P4 for text-only, P1+P4+P7 for
+                # multimodal, P9 for vision.
                 is_core_verification = set(eff_phases) >= core_required
                 partial_status = None
                 partial_note = None
@@ -1093,9 +1192,23 @@ def verify_models(
                         else:
                             p8_pass = False
 
-                    if p1_pass and p4_pass and p7_pass and p8_pass:
+                    # For vision models, Phase 9 is required; text phases 1/4
+                    # are not applicable (no text tower).
+                    p9_pass = True
+                    if is_vision:
+                        p1_pass = True
+                        p4_pass = True
+                        p9 = filtered_scores.get(9)
+                        if p9 is not None:
+                            p9_pass = p9 >= _MIN_PHASE_SCORES.get(9, _DEFAULT_MIN_PHASE_SCORE)
+                        else:
+                            p9_pass = False
+
+                    if p1_pass and p4_pass and p7_pass and p8_pass and p9_pass:
                         partial_status = STATUS_VERIFIED
-                        partial_note = "Core verification completed"
+                        partial_note = "Core verification completed" + _preserved_issue_suffix(
+                            model_id, eff_phases
+                        )
                     elif p1_pass and p4_pass and not p7_pass:
                         p7_score = filtered_scores.get(7)
                         if p7_score is None:
@@ -1108,13 +1221,25 @@ def verify_models(
                             partial_status = STATUS_FAILED
                             partial_note = (
                                 f"Core verification failed: multimodal tests "
-                                f"scored {p7_score}% (requires >= 75%)"
+                                f"scored {p7_score}% (requires >= "
+                                f"{_MIN_PHASE_SCORES.get(7, _DEFAULT_MIN_PHASE_SCORE):g}%)"
+                            )
+                    elif p1_pass and p4_pass and not p9_pass:
+                        p9_score = filtered_scores.get(9)
+                        partial_status = STATUS_FAILED
+                        if p9_score is None:
+                            partial_note = (
+                                "Core verification failed: vision tests skipped (no results)"
+                            )
+                        else:
+                            partial_note = (
+                                f"Core verification failed: vision tests "
+                                f"scored {p9_score}% (requires >= "
+                                f"{_MIN_PHASE_SCORES.get(9, _DEFAULT_MIN_PHASE_SCORE):g}%)"
                             )
                     elif p1_pass:
                         partial_status = STATUS_VERIFIED
-                        partial_note = (
-                            "Core verification passed, but text quality poor. Needs review"
-                        )
+                        partial_note = _p1_only_core_note(p4, all_results)
                     else:
                         # P1 failed — build a descriptive failure note
                         partial_status = STATUS_FAILED
@@ -1151,6 +1276,7 @@ def verify_models(
                     status=partial_status,
                     phase_scores=filtered_scores,
                     note=partial_note,
+                    prompt_profile=_extract_prompt_profile(all_results),
                 )
                 # A provisional run was not numerically verified; do not write a
                 # verification-history record (VerificationHistory.is_verified()
@@ -1161,6 +1287,8 @@ def verify_models(
                         arch,
                         notes=partial_note,
                         sanitize_fn=_sanitize_note,
+                        prompt_profile=_extract_prompt_profile(all_results),
+                        p4_scoring_version=(P4_SCORING_VERSION if 4 in filtered_scores else None),
                     )
                 if partial_status == STATUS_FAILED:
                     progress.failed.append(model_id)
@@ -1184,10 +1312,17 @@ def verify_models(
                 if not quiet:
                     print(f"  No results for requested phases {eff_phases} — skipping update")
                 progress.skipped.append(model_id)
+        elif final_status == STATUS_VERIFIED and _measured_nothing(phase_scores):
+            if not quiet:
+                print(
+                    f"  No phase produced a score (requested {eff_phases}) — "
+                    f"status left unchanged"
+                )
+            progress.skipped.append(model_id)
         elif final_status == STATUS_VERIFIED:
             # A passing run is VERIFIED only if it was numerically compared to an
             # HF reference; a --no-hf-reference (structural-only) pass is PROVISIONAL.
-            written_status = _pass_status(use_hf_reference)
+            written_status = pass_status(use_hf_reference)
             is_provisional = written_status == STATUS_PROVISIONAL
             if is_provisional:
                 note = f"Structural only (no HF reference): {note}"
@@ -1205,6 +1340,7 @@ def verify_models(
                 written_status,
                 phase_scores=phase_scores,
                 note=note,
+                prompt_profile=_extract_prompt_profile(all_results),
             )
             # Provisional runs are not numerically verified — no history record
             # (is_verified() would otherwise report them as verified).
@@ -1213,6 +1349,8 @@ def verify_models(
                     model_id,
                     arch,
                     notes=note,
+                    prompt_profile=_extract_prompt_profile(all_results),
+                    p4_scoring_version=(P4_SCORING_VERSION if 4 in phase_scores else None),
                 )
             if is_provisional:
                 progress.provisional.append(model_id)
@@ -1235,12 +1373,15 @@ def verify_models(
                 note=note,
                 phase_scores=phase_scores,
                 sanitize_fn=_sanitize_note,
+                prompt_profile=_extract_prompt_profile(all_results),
             )
             add_verification_record(
                 model_id,
                 arch,
                 notes=note,
                 sanitize_fn=_sanitize_note,
+                prompt_profile=_extract_prompt_profile(all_results),
+                p4_scoring_version=(P4_SCORING_VERSION if 4 in phase_scores else None),
             )
             progress.failed.append(model_id)
 
@@ -1275,9 +1416,9 @@ def verify_models(
         _save_checkpoint(progress)
 
     # Clean up pre-loaded scoring model
-    if _scoring_model is not None:
-        del _scoring_model
-        del _scoring_tokenizer
+    if _judge_model is not None:
+        del _judge_model
+        del _judge_tokenizer
         gc.collect()
 
     return progress
@@ -1289,6 +1430,7 @@ def _print_dry_run(
     max_memory_gb: float,
     phases: Optional[list[int]] = None,
     use_hf_reference: bool = True,
+    device: str = "cpu",
 ) -> None:
     """Print what would be tested in a dry run."""
     print(f"\nDry run: {len(candidates)} models would be tested")
@@ -1314,7 +1456,11 @@ def _print_dry_run(
             try:
                 n_params = estimate_model_params(c.model_id)
                 mem = estimate_benchmark_memory_gb(
-                    n_params, dtype, phases=phases_to_run, use_hf_reference=use_hf_reference
+                    n_params,
+                    dtype,
+                    phases=phases_to_run,
+                    use_hf_reference=use_hf_reference,
+                    device=device,
                 )
                 status = "OK" if mem <= max_memory_gb else "SKIP (too large)"
                 if mem > max_memory_gb:
@@ -1429,11 +1575,6 @@ Examples:
             "A passing run is recorded as PROVISIONAL, not verified — re-run without "
             "this flag for a real HF-compared verification."
         ),
-    )
-    parser.add_argument(
-        "--no-ht-reference",
-        action="store_true",
-        help="Skip HookedTransformer reference comparison",
     )
     parser.add_argument(
         "--phases",
@@ -1562,6 +1703,7 @@ Examples:
             max_memory_gb,
             phases=args.phases,
             use_hf_reference=not args.no_hf_reference,
+            device=args.device,
         )
         return
 
@@ -1576,7 +1718,6 @@ Examples:
         max_memory_gb=max_memory_gb,
         dtype=args.dtype,
         use_hf_reference=not args.no_hf_reference,
-        use_ht_reference=not args.no_ht_reference,
         phases=args.phases,
         quiet=args.quiet,
         progress=progress,

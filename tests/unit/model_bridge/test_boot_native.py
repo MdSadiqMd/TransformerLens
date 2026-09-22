@@ -1,13 +1,26 @@
 """Tests for ``TransformerBridge.boot_native`` classmethod."""
+
 from __future__ import annotations
 
 import sys
 
+import pytest
 import torch
+import torch.nn as nn
 
 from transformer_lens.config import TransformerBridgeConfig
 from transformer_lens.model_bridge import TransformerBridge
+from transformer_lens.model_bridge.architecture_adapter import ArchitectureAdapter
+from transformer_lens.model_bridge.generalized_components import (
+    LayerNormPreBridge,
+    LinearBridge,
+    RMSNormPreBridge,
+)
 from transformer_lens.model_bridge.sources.native import NativeModel
+from transformer_lens.model_bridge.sources.native.model import (
+    NativeLayerNormPre,
+    NativeRMSNormPre,
+)
 
 
 def _cfg(**overrides) -> TransformerBridgeConfig:
@@ -71,6 +84,109 @@ def test_boot_native_returns_bridge_over_native_model():
     assert isinstance(bridge.original_model, NativeModel)
 
 
+@pytest.mark.parametrize("stop_at_layer", [0, 2, -1])
+def test_boot_native_direct_stop_matches_cached_stop(stop_at_layer: int):
+    bridge = TransformerBridge.boot_native(_cfg(n_layers=3))
+    bridge.eval()
+    tokens = torch.tensor([[1, 2, 3]])
+
+    with torch.no_grad():
+        expected, _ = bridge.run_with_cache(tokens, stop_at_layer=stop_at_layer)
+        actual = bridge(tokens, stop_at_layer=stop_at_layer)
+
+    assert actual.shape == (1, 3, bridge.cfg.d_model)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_boot_native_input_to_embed_round_trip():
+    bridge = TransformerBridge.boot_native(_cfg(n_layers=3))
+    bridge.eval()
+    tokens = torch.tensor([[1, 2, 3]])
+
+    with torch.no_grad():
+        expected = bridge(tokens)
+        residual, returned_tokens, shortformer_pos_embed, attention_mask = bridge.input_to_embed(
+            tokens
+        )
+        actual = bridge(
+            residual,
+            start_at_layer=0,
+            attention_mask=attention_mask,
+        )
+
+    assert residual.shape == (1, 3, bridge.cfg.d_model)
+    assert torch.equal(returned_tokens, tokens)
+    assert shortformer_pos_embed is None
+    torch.testing.assert_close(actual, expected)
+
+
+def test_native_state_dict_round_trip_restores_parameters():
+    bridge = TransformerBridge.boot_native(_cfg())
+
+    saved_state_dict = {key: value.detach().clone() for key, value in bridge.state_dict().items()}
+    original_parameters = {
+        name: parameter.detach().clone() for name, parameter in bridge.named_parameters()
+    }
+
+    with torch.no_grad():
+        for parameter in bridge.parameters():
+            parameter.zero_()
+
+    result = bridge.load_state_dict(saved_state_dict, strict=True)
+
+    assert result.missing_keys == []
+    assert result.unexpected_keys == []
+
+    for name, parameter in bridge.named_parameters():
+        torch.testing.assert_close(parameter, original_parameters[name])
+
+
+def test_native_state_dict_strict_rejects_unexpected_keys():
+    bridge = TransformerBridge.boot_native(_cfg())
+
+    with pytest.raises(RuntimeError, match="Unexpected key"):
+        bridge.load_state_dict(
+            {"not.a.real.weight": torch.zeros(1)},
+            strict=True,
+        )
+
+
+def test_state_dict_round_trip_restores_native_bridge():
+    bridge = TransformerBridge.boot_native(_cfg())
+    expected = {key: value.clone() for key, value in bridge.state_dict().items()}
+
+    with torch.no_grad():
+        for parameter in bridge.parameters():
+            parameter.zero_()
+
+    incompatible_keys = bridge.load_state_dict(expected, strict=True)
+
+    assert incompatible_keys.missing_keys == []
+    assert incompatible_keys.unexpected_keys == []
+    for key, expected_value in expected.items():
+        assert torch.equal(bridge.state_dict()[key], expected_value), key
+
+
+def test_state_dict_strict_load_rejects_missing_tl_key():
+    bridge = TransformerBridge.boot_native(_cfg())
+    state_dict = bridge.state_dict()
+    state_dict.pop("embed.weight")
+
+    with pytest.raises(RuntimeError, match=r"Missing key\(s\)"):
+        bridge.load_state_dict(state_dict, strict=True)
+
+
+def test_load_state_dict_preserves_raw_native_keys():
+    bridge = TransformerBridge.boot_native(_cfg())
+    raw_key = "layers.0.attn.k.weight"
+    actual_key = "layers.0.attn.k._original_component.weight"
+    replacement = torch.full_like(bridge.original_model.state_dict()[actual_key], 0.25)
+
+    bridge.load_state_dict({raw_key: replacement}, strict=False)
+
+    assert torch.equal(bridge.original_model.state_dict()[actual_key], replacement)
+
+
 def test_boot_native_accepts_dict_config():
     cfg_dict = dict(
         d_model=32,
@@ -86,6 +202,26 @@ def test_boot_native_accepts_dict_config():
     bridge = TransformerBridge.boot_native(cfg_dict)
     assert bridge.cfg.d_model == 32
     assert bridge.cfg.architecture == "TransformerLensNative"
+
+
+def test_boot_native_rejects_legacy_config_with_actionable_error():
+    """boot_native reads only type(config).__name__, so a stand-in with the
+    legacy class's name pins the exact error UX without importing the class —
+    this test must survive HookedTransformerConfig's 4.0 deletion."""
+    import pytest
+
+    class HookedTransformerConfig:
+        pass
+
+    legacy_config = HookedTransformerConfig()
+
+    with pytest.raises(
+        TypeError,
+        match=(
+            "boot_native expected a TransformerBridgeConfig or dict, " "got HookedTransformerConfig"
+        ),
+    ):
+        TransformerBridge.boot_native(legacy_config)
 
 
 def test_boot_native_does_not_perturb_global_rng():
@@ -127,6 +263,417 @@ def test_boot_native_distinct_seeds_diverge():
     assert any(diffs), "Two different seeds produced identical params"
 
 
+def test_boot_native_lnpre_param_free():
+    """LNPre builds param-free norm (no learnable weight/bias)."""
+    from transformer_lens.model_bridge.generalized_components.base import (
+        GeneralizedComponent,
+    )
+    from transformer_lens.model_bridge.sources.native.model import NativeLayerNormPre
+
+    bridge = TransformerBridge.boot_native(_cfg(normalization_type="LNPre"))
+    native_model = bridge.original_model
+
+    ln1_wrapped = native_model.layers[0].ln1
+    ln2_wrapped = native_model.layers[0].ln2
+    ln_out_wrapped = native_model.ln_out
+
+    assert isinstance(ln1_wrapped, GeneralizedComponent)
+    assert isinstance(ln2_wrapped, GeneralizedComponent)
+    assert isinstance(ln_out_wrapped, GeneralizedComponent)
+
+    ln1 = ln1_wrapped._original_component
+    ln2 = ln2_wrapped._original_component
+    ln_out = ln_out_wrapped._original_component
+
+    assert isinstance(ln1, NativeLayerNormPre)
+    assert isinstance(ln2, NativeLayerNormPre)
+    assert isinstance(ln_out, NativeLayerNormPre)
+
+    for norm_module in [ln1, ln2, ln_out]:
+        assert not hasattr(norm_module, "weight") or not isinstance(
+            getattr(norm_module, "weight", None), torch.nn.Parameter
+        ), f"LNPre should have no learnable weight"
+        assert not hasattr(norm_module, "bias") or not isinstance(
+            getattr(norm_module, "bias", None), torch.nn.Parameter
+        ), f"LNPre should have no learnable bias"
+
+
+def test_boot_native_rmspre_param_free():
+    """RMSPre builds param-free RMS norm (no learnable weight)."""
+    from transformer_lens.model_bridge.generalized_components.base import (
+        GeneralizedComponent,
+    )
+    from transformer_lens.model_bridge.sources.native.model import NativeRMSNormPre
+
+    bridge = TransformerBridge.boot_native(_cfg(normalization_type="RMSPre"))
+    native_model = bridge.original_model
+
+    ln1_wrapped = native_model.layers[0].ln1
+    ln2_wrapped = native_model.layers[0].ln2
+    ln_out_wrapped = native_model.ln_out
+
+    assert isinstance(ln1_wrapped, GeneralizedComponent)
+    assert isinstance(ln2_wrapped, GeneralizedComponent)
+    assert isinstance(ln_out_wrapped, GeneralizedComponent)
+
+    ln1 = ln1_wrapped._original_component
+    ln2 = ln2_wrapped._original_component
+    ln_out = ln_out_wrapped._original_component
+
+    assert isinstance(ln1, NativeRMSNormPre)
+    assert isinstance(ln2, NativeRMSNormPre)
+    assert isinstance(ln_out, NativeRMSNormPre)
+
+    for norm_module in [ln1, ln2, ln_out]:
+        assert not hasattr(norm_module, "weight") or not isinstance(
+            getattr(norm_module, "weight", None), torch.nn.Parameter
+        ), f"RMSPre should have no learnable weight"
+
+
+def test_boot_native_supports_fold_ln():
+    """Native adapter supports fold_ln and center_writing_weights."""
+    bridge = TransformerBridge.boot_native(_cfg())
+    assert bridge.adapter.supports_fold_ln is True
+    assert bridge.adapter.supports_center_writing_weights is True
+
+
+def test_boot_native_lnpre_forward():
+    """LNPre forward produces correct normalization (param-free LayerNorm)."""
+    from transformer_lens.model_bridge.sources.native.model import NativeLayerNormPre
+
+    norm = NativeLayerNormPre(eps=1e-5)
+    x = torch.tensor([[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]], dtype=torch.float32)
+
+    out = norm(x)
+
+    expected_mean = x.mean(dim=-1, keepdim=True)
+    expected_centered = x - expected_mean
+    expected_scale = (expected_centered.pow(2).mean(dim=-1, keepdim=True) + 1e-5).sqrt()
+    expected = expected_centered / expected_scale
+
+    assert torch.allclose(out, expected, atol=1e-6)
+
+
+def test_boot_native_rmspre_forward():
+    """RMSPre forward produces correct normalization (param-free RMS norm)."""
+    from transformer_lens.model_bridge.sources.native.model import NativeRMSNormPre
+
+    norm = NativeRMSNormPre(eps=1e-5)
+    x = torch.tensor([[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]], dtype=torch.float32)
+
+    out = norm(x)
+
+    x_fp32 = x.to(torch.float32)
+    rms_inv = torch.rsqrt(x_fp32.pow(2).mean(dim=-1, keepdim=True) + 1e-5)
+    expected = (x_fp32 * rms_inv).to(x.dtype)
+
+    assert torch.allclose(out, expected, atol=1e-6)
+
+
+def test_boot_native_skips_custom_init_when_disabled(monkeypatch):
+    def fail_if_called(*_args, **_kwargs):
+        pytest.fail("initialize_native_model was called with init_weights=False")
+
+    def fail_if_forked(*_args, **_kwargs):
+        pytest.fail("fork_rng was called with init_weights=False")
+
+    monkeypatch.setattr(
+        "transformer_lens.model_bridge.sources.native.initialize_native_model",
+        fail_if_called,
+    )
+    monkeypatch.setattr(torch.random, "fork_rng", fail_if_forked)
+    bridge = TransformerBridge.boot_native(_cfg(init_weights=False))
+
+    assert isinstance(bridge.original_model, NativeModel)
+    assert torch.count_nonzero(bridge.original_model.layers[0].attn.q.bias) > 0
+
+
+def test_native_bridge_init_weights_reinitializes_in_place_and_honors_seed():
+    bridge = TransformerBridge.boot_native(_cfg(seed=123))
+    model = bridge.original_model
+    expected = {name: param.detach().clone() for name, param in model.named_parameters()}
+
+    with torch.no_grad():
+        for param in model.parameters():
+            param.fill_(42)
+
+    bridge.init_weights()
+
+    assert bridge.original_model is model
+    for name, param in model.named_parameters():
+        assert torch.equal(param, expected[name]), f"Seed mismatch on {name}"
+
+
+def test_native_bridge_init_weights_does_not_perturb_global_rng():
+    bridge = TransformerBridge.boot_native(_cfg(seed=42))
+    torch.manual_seed(0)
+    expected_after = torch.randn(5)
+
+    torch.manual_seed(0)
+    bridge.init_weights()
+    actual_after = torch.randn(5)
+
+    assert torch.equal(actual_after, expected_after)
+
+
+def test_init_weights_rejects_non_native_bridge():
+    class StubModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(4, 4)
+
+    class StubAdapter(ArchitectureAdapter):
+        def __init__(self, cfg):
+            super().__init__(cfg)
+            self.component_mapping = {"stub_proj": LinearBridge(name="proj")}
+
+    cfg = _cfg(architecture="StubForTest")
+    bridge = TransformerBridge(StubModel(), StubAdapter(cfg), tokenizer=None)
+
+    with pytest.raises(RuntimeError, match=r"boot_native.*StubModel"):
+        bridge.init_weights()
+
+
+def _norm_state_dict_keys(bridge) -> list[str]:
+    """Norm entries a checkpoint would carry, in TL naming."""
+    return [
+        key
+        for key in bridge.state_dict()
+        if ".ln1." in key or ".ln2." in key or key.startswith("ln_final.")
+    ]
+
+
+@pytest.mark.parametrize(
+    "normalization_type, native_cls, bridge_cls",
+    [
+        ("LNPre", NativeLayerNormPre, LayerNormPreBridge),
+        ("RMSPre", NativeRMSNormPre, RMSNormPreBridge),
+    ],
+)
+def test_boot_native_param_free_norms_have_no_parameters(
+    normalization_type, native_cls, bridge_cls
+):
+    """LNPre/RMSPre are param-free by definition; a learnable weight here adds
+    2 * n_layers + 1 tensors the architecture must not have, which breaks strict
+    state_dict loads against TL toy checkpoints (SoLU, attn-only, Othello-GPT)."""
+    cfg = _cfg(n_layers=2, normalization_type=normalization_type)
+    bridge = TransformerBridge.boot_native(cfg)
+    model = bridge.original_model
+
+    norms = [model.layers[0].ln1, model.layers[0].ln2, model.ln_out]
+    for norm in norms:
+        assert isinstance(norm, bridge_cls), type(norm).__name__
+        inner = norm.original_component
+        assert isinstance(inner, native_cls), type(inner).__name__
+        assert list(inner.parameters()) == [], f"{normalization_type} norm has parameters"
+
+    assert _norm_state_dict_keys(bridge) == [], _norm_state_dict_keys(bridge)
+
+
+@pytest.mark.parametrize(
+    "normalization_type, expected_norm_tensors",
+    [("LN", 10), ("RMS", 5)],
+)
+def test_boot_native_parameterized_norms_keep_their_parameters(
+    normalization_type, expected_norm_tensors
+):
+    """Guard against the param-free routing swallowing LN/RMS: 2 layers x (ln1, ln2)
+    plus ln_final is 5 norms, LN carrying weight+bias and RMS weight only."""
+    cfg = _cfg(n_layers=2, normalization_type=normalization_type)
+    bridge = TransformerBridge.boot_native(cfg)
+    keys = _norm_state_dict_keys(bridge)
+    assert len(keys) == expected_norm_tensors, keys
+
+
+@pytest.mark.parametrize("normalization_type", ["LNPre", "RMSPre"])
+def test_boot_native_param_free_state_dict_round_trip(normalization_type):
+    """A param-free checkpoint must load strictly into a param-free model."""
+    source = TransformerBridge.boot_native(
+        _cfg(n_layers=2, normalization_type=normalization_type, seed=1)
+    )
+    saved = {key: value.detach().clone() for key, value in source.state_dict().items()}
+    assert _norm_state_dict_keys(source) == [], "param-free norms leaked state_dict keys"
+
+    target = TransformerBridge.boot_native(
+        _cfg(n_layers=2, normalization_type=normalization_type, seed=2)
+    )
+    expected = {name: p.detach().clone() for name, p in source.named_parameters()}
+    assert any(
+        not torch.equal(p, expected[name]) for name, p in target.named_parameters()
+    ), "source and target already agree; the load would prove nothing"
+
+    result = target.load_state_dict(saved, strict=True)
+    assert result.missing_keys == []
+    assert result.unexpected_keys == []
+    for name, parameter in target.named_parameters():
+        torch.testing.assert_close(parameter, expected[name])
+
+
+@pytest.mark.parametrize("normalization_type", ["LNPre", "RMSPre"])
+def test_boot_native_param_free_forward_matches_reference(normalization_type):
+    """Param-free norms must normalize without applying any scale or shift."""
+    torch.manual_seed(0)
+    x = torch.randn(2, 4, 8)
+    eps = 1e-5
+
+    if normalization_type == "LNPre":
+        centered = x - x.mean(dim=-1, keepdim=True)
+        expected = centered / (centered.pow(2).mean(dim=-1, keepdim=True) + eps).sqrt()
+        actual = NativeLayerNormPre(eps=eps)(x)
+    else:
+        expected = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
+        actual = NativeRMSNormPre(eps=eps)(x)
+
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("normalization_type", ["LNPre", "RMSPre"])
+def test_boot_native_param_free_norm_exposes_scale_and_normalized_hooks(normalization_type):
+    """ActivationCache consumers read hook_scale / hook_normalized; param-free
+    norms must still publish them."""
+    cfg = _cfg(normalization_type=normalization_type)
+    bridge = TransformerBridge.boot_native(cfg)
+    inputs = torch.randint(0, cfg.d_vocab, (2, cfg.n_ctx))
+
+    _, cache = bridge.run_with_cache(inputs, return_type="logits")
+
+    for hook_name in (
+        "blocks.0.ln1.hook_scale",
+        "blocks.0.ln1.hook_normalized",
+        "ln_final.hook_scale",
+        "ln_final.hook_normalized",
+    ):
+        assert hook_name in cache, hook_name
+
+
+def test_boot_native_final_rms_keeps_param_free_norm_param_free():
+    """final_rms swaps the final norm's family; it must not hand an LNPre model
+    a learnable scale it never had."""
+    cfg = _cfg(n_layers=2, normalization_type="LNPre", final_rms=True)
+    bridge = TransformerBridge.boot_native(cfg)
+
+    ln_out = bridge.original_model.ln_out
+    assert isinstance(ln_out, RMSNormPreBridge), type(ln_out).__name__
+    assert isinstance(ln_out.original_component, NativeRMSNormPre)
+    assert list(ln_out.original_component.parameters()) == []
+
+
+def test_native_adapter_declares_fold_ln_support():
+    """The adapter now ships the Q/K/V/O rearranges fold_layer_norm needs, so the
+    ProcessWeights paths are no longer gated off."""
+    bridge = TransformerBridge.boot_native(_cfg())
+    assert bridge.adapter.supports_fold_ln is True
+    assert bridge.adapter.supports_center_writing_weights is True
+    conversions = bridge.adapter.weight_processing_conversions
+    assert "blocks.{i}.attn.q.weight" in conversions
+    assert "blocks.{i}.attn.o.weight" in conversions
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"normalization_type": "LN"}, id="LN"),
+        pytest.param({"normalization_type": "RMS"}, id="RMS"),
+        pytest.param({"normalization_type": "LNPre"}, id="LNPre"),
+        pytest.param({"normalization_type": "RMSPre"}, id="RMSPre"),
+        pytest.param({"normalization_type": "LN", "attn_only": True}, id="LN-attn-only"),
+        pytest.param(
+            {
+                "normalization_type": "RMS",
+                "positional_embedding_type": "rotary",
+                "gated_mlp": True,
+                "act_fn": "silu",
+                "final_rms": True,
+            },
+            id="RMS-rotary-gated",
+        ),
+        pytest.param(
+            {"normalization_type": "RMS", "n_heads": 4, "d_head": 8, "n_key_value_heads": 2},
+            id="RMS-gqa",
+        ),
+    ],
+)
+def test_boot_native_weight_processing_preserves_predictions(overrides, recwarn):
+    """fold_ln + center_writing_weights are only claimed if they are output-preserving.
+    Compared on log_softmax, since center_unembed shifts raw logits by a constant."""
+    cfg = _cfg(n_layers=2, **overrides)
+    bridge = TransformerBridge.boot_native(cfg)
+
+    # Identity norm weights make folding a no-op; randomize so the math is exercised.
+    torch.manual_seed(7)
+    with torch.no_grad():
+        for name, parameter in bridge.named_parameters():
+            if ".ln" not in name:
+                continue
+            if name.endswith("weight"):
+                parameter.copy_(torch.randn_like(parameter) * 0.5 + 1.0)
+            elif name.endswith("bias"):
+                parameter.copy_(torch.randn_like(parameter) * 0.1)
+
+    bridge.eval()
+    inputs = torch.randint(0, cfg.d_vocab, (2, cfg.n_ctx))
+    with torch.no_grad():
+        before = bridge(inputs, return_type="logits").log_softmax(-1)
+
+    snapshot = {name: p.detach().clone() for name, p in bridge.named_parameters()}
+    bridge.enable_compatibility_mode(
+        fold_ln=True,
+        center_writing_weights=True,
+        center_unembed=True,
+        fold_value_biases=True,
+        refactor_factored_attn_matrices=False,
+    )
+
+    unsupported = [
+        str(warning.message) for warning in recwarn if "does not support" in str(warning.message)
+    ]
+    assert unsupported == [], unsupported
+
+    with torch.no_grad():
+        after = bridge(inputs, return_type="logits").log_softmax(-1)
+
+    current = dict(bridge.named_parameters())
+    moved = [
+        name
+        for name, old in snapshot.items()
+        if name in current
+        and (current[name].shape != old.shape or not torch.equal(current[name], old))
+    ]
+    # Without a real weight rewrite the invariance below would be vacuous. RMSPre
+    # has neither norm weights to fold nor a centering path, so only the unembed moves.
+    assert len(moved) >= 1, "weight processing rewrote nothing"
+
+    torch.testing.assert_close(after, before, atol=1e-4, rtol=1e-4)
+
+
+def test_boot_native_fold_ln_zeroes_norm_parameters():
+    """fold_ln must actually absorb the norm into the downstream weights — an
+    untouched ln1.weight means the fold silently skipped the layer."""
+    cfg = _cfg(n_layers=2, normalization_type="LN")
+    bridge = TransformerBridge.boot_native(cfg)
+
+    torch.manual_seed(11)
+    with torch.no_grad():
+        for name, parameter in bridge.named_parameters():
+            if ".ln1." in name and name.endswith("weight"):
+                parameter.copy_(torch.randn_like(parameter) * 0.5 + 1.0)
+
+    q_before = bridge.original_model.layers[0].attn.q.weight.detach().clone()
+
+    bridge.enable_compatibility_mode(
+        fold_ln=True,
+        center_writing_weights=False,
+        center_unembed=False,
+        fold_value_biases=False,
+        refactor_factored_attn_matrices=False,
+    )
+
+    ln1_weight = bridge.original_model.layers[0].ln1.weight
+    torch.testing.assert_close(ln1_weight, torch.ones_like(ln1_weight))
+    q_after = bridge.original_model.layers[0].attn.q.weight
+    assert not torch.equal(q_after, q_before), "ln1 scale never reached the Q projection"
+
+
 def test_boot_native_forward_and_cache():
     cfg = _cfg()
     bridge = TransformerBridge.boot_native(cfg)
@@ -135,6 +682,35 @@ def test_boot_native_forward_and_cache():
     assert logits.shape == (2, cfg.n_ctx, cfg.d_vocab)
     _, cache = bridge.run_with_cache(inputs, return_type="logits")
     assert "blocks.0.attn.hook_pattern" in cache
+
+
+@pytest.mark.parametrize("prepend_bos", [True, False])
+def test_run_with_cache_forwards_prepend_bos_for_string_input(monkeypatch, prepend_bos):
+    cfg = _cfg()
+    bridge = TransformerBridge.boot_native(cfg)
+    bridge._tokenizer = object()
+    tokenization_calls = []
+
+    def to_tokens(input, prepend_bos=None, padding_side=None):
+        tokenization_calls.append((input, prepend_bos, padding_side))
+        if prepend_bos is None:
+            prepend_bos = bridge.cfg.default_prepend_bos
+        tokens = [0, 7] if prepend_bos else [7]
+        return torch.tensor([tokens])
+
+    monkeypatch.setattr(bridge, "to_tokens", to_tokens)
+    bridge.eval()
+
+    with torch.no_grad():
+        direct_logits = bridge("hello", prepend_bos=prepend_bos)
+        cached_logits, cache = bridge.run_with_cache("hello", prepend_bos=prepend_bos)
+
+    assert tokenization_calls == [
+        ("hello", prepend_bos, None),
+        ("hello", prepend_bos, None),
+    ]
+    torch.testing.assert_close(cached_logits, direct_logits)
+    assert cache["hook_embed"].shape[1] == direct_logits.shape[1]
 
 
 def test_boot_native_does_not_load_transformers_runtime():
@@ -289,8 +865,8 @@ def test_boot_native_does_not_mutate_supplied_config():
 
 
 def test_native_gelu_new_uses_tanh_approximation():
-    """gelu_new must compute the tanh-approximation that HF GPT-2 and
-    HookedTransformer use, not plain (erf-based) GELU. A plain alias would
+    """gelu_new must compute the tanh-approximation that HF GPT-2 uses,
+    not plain (erf-based) GELU. A plain alias would
     produce small but persistent drift in parity comparisons."""
     import torch.nn.functional as F
 
@@ -323,3 +899,185 @@ def test_boot_native_supports_training_step():
     ), "No non-zero gradients after backward"
     optimizer.step()
     optimizer.zero_grad()
+
+
+def test_boot_native_fold_ln_output_invariant():
+    """fold_ln should not change model output (mathematically equivalent).
+
+    Uses randomized LN weights to actually exercise the folding math, and compares
+    at the logit level for precision.
+    """
+    cfg = _cfg(n_layers=2)
+    bridge = TransformerBridge.boot_native(cfg)
+
+    # Randomize LN weights to actually test folding (identity weights make fold a no-op)
+    torch.manual_seed(42)
+    with torch.no_grad():
+        for name, param in bridge.named_parameters():
+            if "ln" in name.lower() and "weight" in name:
+                param.copy_(torch.randn_like(param) * 0.5 + 1.0)
+            elif "ln" in name.lower() and "bias" in name:
+                param.copy_(torch.randn_like(param) * 0.1)
+
+    inputs = torch.randint(0, cfg.d_vocab, (2, cfg.n_ctx))
+    with torch.no_grad():
+        logits_unfolded = bridge(inputs, return_type="logits")
+
+    bridge.enable_compatibility_mode(
+        fold_ln=True,
+        center_writing_weights=False,
+        center_unembed=False,
+        fold_value_biases=False,
+        refactor_factored_attn_matrices=False,
+    )
+
+    with torch.no_grad():
+        logits_folded = bridge(inputs, return_type="logits")
+
+    assert torch.allclose(
+        logits_folded, logits_unfolded, atol=1e-4, rtol=1e-4
+    ), f"fold_ln should not change logits: max diff={torch.abs(logits_folded - logits_unfolded).max():.6e}"
+
+
+def test_boot_native_lnpre_compatibility_mode():
+    """LNPre models should work with enable_compatibility_mode without crashing.
+
+    LNPre has no weights to fold, so fold_ln should be a no-op. The key is that
+    it doesn't crash (e.g. EinopsError from shape mismatches).
+    """
+    cfg = _cfg(n_layers=2, normalization_type="LNPre")
+    bridge = TransformerBridge.boot_native(cfg)
+
+    inputs = torch.randint(0, cfg.d_vocab, (2, cfg.n_ctx))
+    with torch.no_grad():
+        logits_before = bridge(inputs, return_type="logits")
+
+    # This should not crash — fold_ln on param-free norms is a no-op
+    bridge.enable_compatibility_mode(
+        fold_ln=True,
+        center_writing_weights=False,
+        center_unembed=False,
+        fold_value_biases=False,
+        refactor_factored_attn_matrices=False,
+    )
+
+    with torch.no_grad():
+        logits_after = bridge(inputs, return_type="logits")
+
+    # Since LNPre has no weights, output should be unchanged
+    assert torch.allclose(
+        logits_after, logits_before, atol=1e-6
+    ), f"LNPre fold_ln should be no-op: max diff={torch.abs(logits_after - logits_before).max():.6e}"
+
+
+def test_boot_native_lnpre_has_hooks():
+    """LNPre should expose hook_scale and hook_normalized for ActivationCache compatibility."""
+    cfg = _cfg(normalization_type="LNPre")
+    bridge = TransformerBridge.boot_native(cfg)
+
+    inputs = torch.randint(0, cfg.d_vocab, (2, cfg.n_ctx))
+    _, cache = bridge.run_with_cache(inputs, return_type="logits")
+
+    # Check that the scale and normalized hooks are present
+    assert "blocks.0.ln1.hook_scale" in cache, "LNPre should have hook_scale"
+    assert "blocks.0.ln1.hook_normalized" in cache, "LNPre should have hook_normalized"
+    assert "ln_final.hook_scale" in cache, "ln_final should have hook_scale"
+    assert "ln_final.hook_normalized" in cache, "ln_final should have hook_normalized"
+
+
+def test_boot_native_resolves_initializer_range_sentinel():
+    """Regression for #1568 — the resolved initializer range must be used by boot_native."""
+    import math
+
+    cfg = _cfg(init_mode="gpt2")
+    expected = 0.8 / math.sqrt(cfg.d_model)
+
+    assert cfg.initializer_range == pytest.approx(expected)
+
+    bridge = TransformerBridge.boot_native(cfg)
+    assert bridge.W_E.std().item() == pytest.approx(expected, rel=0.15)
+
+
+def test_boot_native_resolves_non_gpt2_initializer_range_sentinel():
+    cfg = _cfg(init_mode="kaiming_normal")
+
+    assert cfg.initializer_range == pytest.approx(1.0)
+
+
+def test_boot_native_kaiming_gain_scales_weights():
+    """Regression for #1568 — xavier/kaiming init must use initializer_range
+    as a multiplicative gain. Without this, the config value is silently
+    ignored and every kaiming/xavier model gets the same fixed scale
+    regardless of what the caller asked for."""
+    cfg_gain_1 = _cfg(init_mode="kaiming_normal", initializer_range=1.0, seed=0)
+    cfg_gain_2 = _cfg(init_mode="kaiming_normal", initializer_range=2.0, seed=0)
+
+    bridge_1 = TransformerBridge.boot_native(cfg_gain_1)
+    bridge_2 = TransformerBridge.boot_native(cfg_gain_2)
+
+    std_1 = bridge_1.W_E.std().item()
+    std_2 = bridge_2.W_E.std().item()
+
+    # Same seed, only gain differs -> std should scale ~proportionally.
+    assert std_2 / std_1 == pytest.approx(2.0)
+
+
+class TestPatternHookWrites:
+    """hook_pattern must be write-capable on native bridges: the hook runs
+    inside NativeAttention (pattern_fn seam), before the value matmul —
+    post-hoc tuple firing silently discarded edits."""
+
+    def _bridge(self):
+        cfg = _cfg()
+        return TransformerBridge.boot_native(cfg)
+
+    def test_pattern_edits_reach_the_output(self):
+        bridge = self._bridge()
+        tokens = torch.tensor([[1, 2, 3]])
+        base = bridge(tokens, return_type="logits")
+        edited = bridge.run_with_hooks(
+            tokens,
+            fwd_hooks=[("blocks.0.attn.hook_pattern", lambda t, hook=None: torch.zeros_like(t))],
+        )
+        assert not torch.allclose(edited, base), "pattern zeroing must change logits"
+
+    def test_observe_only_stays_bit_exact(self):
+        bridge = self._bridge()
+        tokens = torch.tensor([[1, 2, 3]])
+        base = bridge(tokens, return_type="logits")
+        observed = bridge.run_with_hooks(
+            tokens, fwd_hooks=[("blocks.0.attn.hook_pattern", lambda t, hook=None: t)]
+        )
+        assert torch.equal(observed, base)
+
+    def test_cache_reflects_the_edited_pattern(self):
+        """The cached pattern is the value the model actually used."""
+        bridge = self._bridge()
+        tokens = torch.tensor([[1, 2, 3]])
+
+        def uniform(t, hook=None):
+            return (
+                torch.full_like(t, 1.0 / t.shape[-1]).tril() * 0
+                + t * 0
+                + torch.softmax(
+                    torch.zeros_like(t).masked_fill(torch.triu(torch.ones_like(t), 1).bool(), -1e9),
+                    dim=-1,
+                )
+            )
+
+        with bridge.hooks(fwd_hooks=[("blocks.0.attn.hook_pattern", uniform)]):
+            _, cache = bridge.run_with_cache(tokens, names_filter=["blocks.0.attn.hook_pattern"])
+        cached = cache["blocks.0.attn.hook_pattern"]
+        expected = uniform(torch.zeros_like(cached))
+        torch.testing.assert_close(cached, expected)
+
+    def test_hook_fires_exactly_once_per_forward(self):
+        """The inside-the-computation seam must not double-fire with the old
+        post-hoc tuple path."""
+        bridge = self._bridge()
+        fired = []
+        bridge.run_with_hooks(
+            torch.tensor([[1, 2, 3]]),
+            fwd_hooks=[("blocks.0.attn.hook_pattern", lambda t, hook=None: fired.append(1) or t)],
+        )
+        assert len(fired) == 1, f"hook fired {len(fired)} times"

@@ -16,6 +16,7 @@ from transformer_lens.model_bridge.generalized_components.attention import (
 )
 from transformer_lens.model_bridge.generalized_components.base import (
     GeneralizedComponent,
+    align_offloaded_subtree,
 )
 from transformer_lens.model_bridge.generalized_components.linear import LinearBridge
 from transformer_lens.utilities.quantization import require_readable_weight
@@ -100,9 +101,12 @@ class JointQKVAttentionBridge(AttentionBridge):
 
         # Exclude stale qkv combined weights from state_dict after splitting.
         self._register_state_dict_hook(JointQKVAttentionBridge._filter_qkv_state_dict)
+        self.register_load_state_dict_pre_hook(
+            JointQKVAttentionBridge._restore_filtered_qkv_state_dict
+        )
 
     def __deepcopy__(self, memo):
-        """Share split_qkv_matrix and config across clones instead of copying.
+        """Share split_qkv_matrix across clones instead of copying.
 
         split_qkv_matrix may be a bound method of the architecture adapter,
         which transitively references the full HF model. Without this override,
@@ -127,8 +131,29 @@ class JointQKVAttentionBridge(AttentionBridge):
             self.config = saved_config
 
         clone.split_qkv_matrix = saved_split_fn
-        clone.config = saved_config
+        clone.config = self._resolve_cloned_config(saved_config, memo)
         return clone
+
+    @staticmethod
+    def _resolve_cloned_config(config: Any, memo: Dict[int, Any]) -> Any:
+        """Pick the config a clone reads: the shared live one, or the cloning bridge's own.
+
+        Block replication deepcopies a block template while no Bridge owns the config
+        yet, and those clones must keep sharing the live one so every layer stays on a
+        single object. But a whole-bridge deepcopy gives the clone its own cfg, and an
+        attention still pointing at the original's config makes the clone's
+        ``use_attn_result`` rewire the ORIGINAL's forward -- a pristine control model
+        corrupted with no error. The owning Bridge sitting in ``memo`` is what tells the
+        two cases apart; copying through ``memo`` then hands back the very object that
+        Bridge clone adopts as its cfg instead of forking a third one.
+        """
+        if config is None:
+            return None
+        bridge_ref = getattr(config, "_bridge_ref", None)
+        live_bridge = bridge_ref() if bridge_ref is not None else None
+        if live_bridge is None or id(live_bridge) not in memo:
+            return config
+        return copy.deepcopy(config, memo)
 
     @staticmethod
     def _filter_qkv_state_dict(
@@ -142,6 +167,29 @@ class JointQKVAttentionBridge(AttentionBridge):
         keys_to_remove = [k for k in state_dict if k.startswith(qkv_prefix)]
         for k in keys_to_remove:
             del state_dict[k]
+
+    @staticmethod
+    def _restore_filtered_qkv_state_dict(
+        module: torch.nn.Module,
+        state_dict: Dict[str, Any],
+        prefix: str,
+        local_metadata: Dict[str, Any],
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        """Insert current combined weights only to satisfy strict key matching.
+
+        Production checkpoints restore authoritative values through the unfiltered
+        Hugging Face ``_original_component`` path.
+        """
+        del local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        qkv = module._modules.get("qkv")
+        if qkv is None:
+            return
+        for key, value in qkv.state_dict(prefix=f"{prefix}qkv.").items():
+            state_dict.setdefault(key, value)
 
     def _create_qkv_conversion_rule(self) -> BaseTensorConversion:
         """Create the appropriate conversion rule for the individual q, k, and v matrices.
@@ -291,9 +339,20 @@ class JointQKVAttentionBridge(AttentionBridge):
             original_component, "reorder_and_upcast_attn", False
         )
 
-        q_transformation, k_transformation, v_transformation = self.split_qkv_matrix(
-            original_component
-        )
+        # split_qkv_matrix reads original_component's raw weight/bias once, here,
+        # to build independent q/k/v slices - not a live view, so under Accelerate
+        # offload this needs the real (not meta) data materialized for this one
+        # read. The resulting slices are real, standalone tensors that stay valid
+        # afterward regardless of what Accelerate later does to original_component
+        # (unlike whatever reads original_component itself on every forward call,
+        # e.g. GeneralizedComponent.__call__ / LinearBridge for "o"/c_proj, split
+        # q/k/v specifically stay permanently resident rather than re-offloading
+        # after each forward - a deliberate, small, documented memory trade-off
+        # for combined-qkv architectures).
+        with align_offloaded_subtree(original_component):
+            q_transformation, k_transformation, v_transformation = self.split_qkv_matrix(
+                original_component
+            )
         self.q.set_original_component(q_transformation)
         self.k.set_original_component(k_transformation)
         self.v.set_original_component(v_transformation)

@@ -18,6 +18,17 @@ import warnings
 import pytest
 import torch
 
+from transformer_lens.tools.analysis.jacobian_lens_coordinate_patch import (
+    solve_coordinate_patch,
+)
+from transformer_lens.tools.analysis.jacobian_lens_decomposition import (
+    get_sparse_decomposition,
+)
+from transformer_lens.tools.analysis.projection_kernel import (
+    SubspaceBasis,
+    projection_kernel,
+)
+
 # Skip the entire module on non-MPS runners (Linux CI, CPU-only Macs)
 pytestmark = pytest.mark.skipif(
     not torch.backends.mps.is_available(),
@@ -33,9 +44,11 @@ SMALL_MODEL = "roneneldan/TinyStories-1M"  # ~50MB, safe for 1GB runner budget
 
 def _load_tiny_model(device: str = "mps"):
     """Load TinyStories-1M on the given device with float32 (bfloat16 unsupported on MPS)."""
-    from transformer_lens import HookedTransformer
+    from transformer_lens.model_bridge import TransformerBridge
 
-    return HookedTransformer.from_pretrained(SMALL_MODEL, device=device, dtype=torch.float32)
+    bridge = TransformerBridge.boot_transformers(SMALL_MODEL, device=device, dtype=torch.float32)
+    bridge.enable_compatibility_mode()
+    return bridge
 
 
 def _cleanup(model=None):
@@ -92,6 +105,33 @@ def test_mps_get_device_falls_back_to_cpu_without_env_var():
             os.environ["TRANSFORMERLENS_ALLOW_MPS"] = original
 
 
+def test_mps_jspace_decomposition_moves_before_float64_conversion():
+    """The NNLS work moves to CPU before its unsupported float64 conversion."""
+    dictionary = torch.eye(5, device="mps")[:4]
+    activation = 2.0 * dictionary[0] + 3.0 * dictionary[1]
+
+    result = get_sparse_decomposition(activation, dictionary, k=2)
+
+    assert result.reconstruction.device.type == "mps"
+    torch.testing.assert_close(result.reconstruction, activation)
+    _cleanup()
+
+
+def test_mps_jspace_coordinate_patch_stays_on_device():
+    """Coordinate patching keeps vector outputs on MPS while diagnostics run safely."""
+    dictionary = torch.eye(5, device="mps")[:4]
+    activation = 2.0 * dictionary[0] + 3.0 * dictionary[1]
+    decomposition = get_sparse_decomposition(activation, dictionary, k=2)
+
+    result = solve_coordinate_patch(activation, dictionary, 0, 2, decomposition=decomposition)
+
+    assert result.patched.device.type == "mps"
+    torch.testing.assert_close(
+        result.patched, torch.tensor([0.0, 3.0, 2.0, 0.0, 0.0], device="mps")
+    )
+    _cleanup()
+
+
 def test_mps_warn_if_mps_emits_warning_without_env_var():
     """warn_if_mps() emits a UserWarning when MPS is used without the env var."""
     import transformer_lens.utilities.devices as devices_module
@@ -136,6 +176,31 @@ def test_mps_tensor_basic_operations():
     assert z_cpu.device.type == "cpu"
 
     _cleanup()
+
+
+def test_mps_projection_kernel_principal_angles():
+    """Projection Kernel computes principal angles and preserves the MPS device."""
+    try:
+        basis = torch.eye(4, device="mps", dtype=torch.float32)[:, :2]
+        subspace = SubspaceBasis(
+            basis=basis,
+            singular_values=torch.ones(2, device="mps"),
+            rank=2,
+            measured_rank=2,
+            rtol=4 * torch.finfo(torch.float32).eps,
+            threshold=4 * torch.finfo(torch.float32).eps,
+            input_shape=(4, 2),
+        )
+
+        result = projection_kernel(subspace, subspace)
+
+        assert result.score.device.type == "mps"
+        assert result.normalized.device.type == "mps"
+        assert result.cosines.device.type == "mps"
+        assert result.angles.device.type == "mps"
+        assert result.cosines.cpu().tolist() == pytest.approx([1.0, 1.0])
+    finally:
+        _cleanup()
 
 
 def test_mps_softmax_and_layernorm():

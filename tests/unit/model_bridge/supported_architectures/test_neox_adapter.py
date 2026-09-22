@@ -150,7 +150,57 @@ class TestNeoxAdapterComponentMapping:
         assert mapping["rotary_emb"].name == "gpt_neox.rotary_emb"
         assert mapping["blocks"].name == "gpt_neox.layers"
         assert mapping["ln_final"].name == "gpt_neox.final_layer_norm"
-        assert mapping["unembed"].name == "embed_out"
+        # transformers >= 5.14 renamed GPTNeoXForCausalLM.embed_out to lm_head.
+        assert mapping["unembed"].name == "lm_head"
+
+    def test_unembed_resolves_against_transformers_5_14_lm_head_layout(
+        self, adapter: NeoxArchitectureAdapter
+    ) -> None:
+        """The unembed must resolve on the >= 5.14 layout, which exposes lm_head, not embed_out."""
+        unembed = adapter.component_mapping["unembed"]
+        assert unembed.name == "lm_head"
+
+        class _LmHeadOnlyModel(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.lm_head = torch.nn.Linear(4, 8, bias=False)
+
+        hf_model = _LmHeadOnlyModel()
+        assert not hasattr(hf_model, "embed_out")
+        assert adapter.get_remote_component(hf_model, unembed.name) is hf_model.lm_head
+
+    def test_prepare_model_keeps_lm_head_when_present(
+        self, adapter: NeoxArchitectureAdapter
+    ) -> None:
+        """The >= 5.14 layout exposes lm_head; prepare_model must leave the default alone."""
+
+        class _LmHeadOnlyModel(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.lm_head = torch.nn.Linear(4, 8, bias=False)
+
+        hf_model = _LmHeadOnlyModel()
+        adapter.prepare_model(hf_model)
+
+        assert adapter.component_mapping["unembed"].name == "lm_head"
+
+    def test_prepare_model_falls_back_to_embed_out_on_5_13_layout(
+        self, adapter: NeoxArchitectureAdapter
+    ) -> None:
+        """The repo's locked transformers==5.13.0 only exposes embed_out, not lm_head."""
+
+        class _EmbedOutOnlyModel(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.embed_out = torch.nn.Linear(4, 8, bias=False)
+
+        hf_model = _EmbedOutOnlyModel()
+        assert not hasattr(hf_model, "lm_head")
+
+        adapter.prepare_model(hf_model)
+
+        assert adapter.component_mapping["unembed"].name == "embed_out"
+        assert adapter.get_remote_component(hf_model, "embed_out") is hf_model.embed_out
 
     def test_block_submodule_keys(self, adapter: NeoxArchitectureAdapter) -> None:
         blocks = adapter.component_mapping["blocks"]
@@ -247,6 +297,27 @@ class TestNeoxAdapterWeightConversions:
 
 class TestNeoxSetupComponentTesting:
     """setup_component_testing must wire NeoX's rotary embedding into attention bridges."""
+
+    def test_sets_rotary_emb_on_template_attention(self, adapter: NeoxArchitectureAdapter) -> None:
+        rotary_emb = object()
+        template = adapter.get_generalized_component("blocks.0.attn")
+        assert isinstance(template, JointQKVPositionEmbeddingsAttentionBridge)
+
+        adapter.setup_component_testing(_fake_hf_model(rotary_emb))
+
+        assert template._rotary_emb is rotary_emb
+
+    def test_does_not_force_eager_attention(self, adapter: NeoxArchitectureAdapter) -> None:
+        """NeoX component parity does not require eager, so the HF attn
+        implementation must be left untouched."""
+        hf_model = SimpleNamespace(
+            gpt_neox=SimpleNamespace(rotary_emb=object()),
+            config=SimpleNamespace(_attn_implementation="sdpa"),
+        )
+
+        adapter.setup_component_testing(hf_model)
+
+        assert hf_model.config._attn_implementation == "sdpa"
 
     def test_sets_rotary_emb_on_bridge_model_blocks(self, adapter: NeoxArchitectureAdapter) -> None:
         rotary_emb = object()

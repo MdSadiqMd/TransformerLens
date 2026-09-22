@@ -16,6 +16,7 @@ from transformer_lens.config.transformer_lens_config import TransformerLensConfi
 from transformer_lens.FactoredMatrix import FactoredMatrix
 from transformer_lens.model_bridge.architecture_adapter import ArchitectureAdapter
 from transformer_lens.utilities import filter_dict_by_prefix
+from transformer_lens.utilities.architectures import POST_NORM_ARCHITECTURES
 
 
 class ProcessWeights:
@@ -419,6 +420,58 @@ class ProcessWeights:
         }
 
     @staticmethod
+    def _fold_short_conv_layer_norm(
+        state_dict: Dict[str, torch.Tensor],
+        cfg,
+        layer: int,
+        fold_biases: bool,
+        adapter,
+        ln1_w: torch.Tensor,
+        ln1_b: Optional[torch.Tensor],
+        keys: Dict[str, str],
+    ) -> bool:
+        """Fold ln1 into a short-conv mixer's in-projection. Returns whether it folded.
+
+        Hybrid stacks (LFM2) interleave attention layers with short-conv layers that
+        have no q_proj, so the attention path skips them and their gain would survive
+        into an otherwise-folded model — one basis per layer type. The in-projection
+        is the mixer's only reader of the norm output (the conv and the gates consume
+        its outputs), so scaling its input columns is exact despite the mixer being
+        quadratic in that projection.
+        """
+        w_key = ProcessWeights._get_param_key(f"blocks.{layer}.conv.W_in", adapter)
+        conv_W_in = state_dict.get(w_key)
+        if conv_W_in is None:
+            return False
+
+        rmsnorm_uses_offset = getattr(cfg, "rmsnorm_uses_offset", False)
+        effective_ln1_w = (1.0 + ln1_w) if rmsnorm_uses_offset else ln1_w
+        if conv_W_in.shape[-1] == effective_ln1_w.shape[0]:
+            ln1_w_broadcast = effective_ln1_w[None, :]
+            sum_dim = -1
+        elif conv_W_in.shape[0] == effective_ln1_w.shape[0]:
+            ln1_w_broadcast = effective_ln1_w[:, None]
+            sum_dim = -2
+        else:
+            return False
+
+        b_key = ProcessWeights._get_param_key(f"blocks.{layer}.conv.b_in", adapter)
+        if fold_biases and ln1_b is not None:
+            # Absorbing the shift needs somewhere to put it; fabricating a bias the
+            # mixer does not have would not survive distribution to the component.
+            if b_key not in state_dict:
+                return False
+            ln1_b_broadcast = ln1_b[None, :] if sum_dim == -1 else ln1_b[:, None]
+            state_dict[b_key] = state_dict[b_key] + (conv_W_in * ln1_b_broadcast).sum(sum_dim)
+            state_dict[keys["ln1_b"]] = torch.zeros_like(ln1_b)
+
+        state_dict[w_key] = conv_W_in * ln1_w_broadcast
+        state_dict[keys["ln1_w"]] = (
+            torch.zeros_like(ln1_w) if rmsnorm_uses_offset else torch.ones_like(ln1_w)
+        )
+        return True
+
+    @staticmethod
     def _fold_layer(
         state_dict: Dict[str, torch.Tensor],
         cfg,
@@ -524,6 +577,13 @@ class ProcessWeights:
                 adapter,
                 cfg,
                 layer,
+            )
+        elif ln1_w is not None:
+            assert isinstance(ln1_w, torch.Tensor)
+            assert ln1_b is None or isinstance(ln1_b, torch.Tensor)
+            assert isinstance(keys, dict)
+            ProcessWeights._fold_short_conv_layer_norm(
+                state_dict, cfg, layer, fold_biases, adapter, ln1_w, ln1_b, keys
             )
 
         # ln1_post.w (Gemma 2/3): keep original; independent post-attention normalization
@@ -639,30 +699,27 @@ class ProcessWeights:
         if has_ln and ln2_w is not None:
             # MoE layers: fold ln2 into router gate and each expert's W_in/W_gate
             if getattr(cfg, "num_experts", None) is not None and cfg.num_experts > 0:
-                # MoE: fold into router + experts; skip identity if wrapped
-                expert_fold_count = 0
-                expected_expert_folds = cfg.num_experts * 2  # W_in + W_gate per expert
-
-                # Fold into router gate
-                router_key = ProcessWeights._resolve_state_dict_key(
-                    state_dict, f"blocks.{layer}.mlp.W_gate.weight", layer
-                )
-                if router_key in state_dict:
-                    state_dict[router_key] = state_dict[router_key] * ln2_w[None, :]
-                # Fold into each expert's W_in and W_gate (SwiGLU gate)
-                for e in range(cfg.num_experts):
-                    for suffix in ("W_in.weight", "W_gate.weight"):
-                        key = ProcessWeights._resolve_state_dict_key(
-                            state_dict,
-                            f"blocks.{layer}.mlp.experts.{e}.{suffix}",
-                            layer,
-                        )
-                        if key in state_dict:
-                            state_dict[key] = state_dict[key] * ln2_w[None, :]
-                            expert_fold_count += 1
-
-                # Only set ln2 to identity if we actually folded into expert weights.
-                if expert_fold_count > 0:
+                # Every expert reads ln2's output, so folding into only some of them
+                # would change the model — collect them all before touching anything.
+                expert_keys = [
+                    key
+                    for e in range(cfg.num_experts)
+                    for suffix in ("W_in.weight", "W_gate.weight")
+                    for key in (
+                        ProcessWeights._resolve_state_dict_key(
+                            state_dict, f"blocks.{layer}.mlp.experts.{e}.{suffix}", layer
+                        ),
+                    )
+                    if key in state_dict
+                ]
+                if expert_keys:
+                    router_key = ProcessWeights._resolve_state_dict_key(
+                        state_dict, f"blocks.{layer}.mlp.W_gate.weight", layer
+                    )
+                    if router_key in state_dict:
+                        state_dict[router_key] = state_dict[router_key] * ln2_w[None, :]
+                    for key in expert_keys:
+                        state_dict[key] = state_dict[key] * ln2_w[None, :]
                     if ln2_w_key is not None:
                         state_dict[ln2_w_key] = torch.ones_like(ln2_w)
                         alternate_ln2_w_key = (
@@ -672,11 +729,15 @@ class ProcessWeights:
                         )
                         if alternate_ln2_w_key != ln2_w_key and alternate_ln2_w_key in state_dict:
                             state_dict[alternate_ln2_w_key] = torch.ones_like(ln2_w)
-                else:
-                    # No expert weights found — undo router gate fold for consistency.
-                    if router_key in state_dict:
-                        state_dict[router_key] = state_dict[router_key] / ln2_w[None, :]
-                return state_dict
+                    return state_dict
+
+                # A dense layer of an interleaved stack (Llama4, Laguna, LLaDA2-MoE,
+                # LFM2-MoE) parks its gated MLP under dense_in/dense_gate and has no
+                # experts of its own, so it folds exactly like a non-MoE layer. Anything
+                # else here is a sparse layer whose expert weights this state dict does
+                # not carry — leave its ln2 alone rather than fold half the readers.
+                if not mlp_W_in_key.endswith(".mlp.dense_in.weight"):
+                    return state_dict
 
             mlp_W_in = ProcessWeights.convert_tensor_to_tl_format(
                 mlp_W_in_key, state_dict, state_dict.get(mlp_W_in_key), cfg, adapter, layer
@@ -815,35 +876,34 @@ class ProcessWeights:
             assert mlp_ln_b is not None, f"MLP ln.b not found at key {mlp_ln_b_key}"
             assert mlp_ln_w is not None, f"MLP ln.w not found at key {mlp_ln_w_key}"
 
+            # TL keys hold W_out as [d_mlp, d_model]; nn.Linear bridges hold [d_model, d_mlp].
+            # The fold and the centering must use the same neuron axis, so resolve it once.
+            d_mlp = mlp_ln_w.shape[0]
+            if mlp_W_out.shape[0] == d_mlp and mlp_W_out.shape[-1] != d_mlp:
+                neuron_dim = 0
+            elif mlp_W_out.shape[-1] == d_mlp and mlp_W_out.shape[0] != d_mlp:
+                neuron_dim = -1
+            else:
+                raise ValueError(
+                    f"Cannot resolve the neuron axis of MLP W_out {tuple(mlp_W_out.shape)} "
+                    f"against the mid-MLP LayerNorm (d_mlp={d_mlp}) at layer {layer}."
+                )
+            ln_shape = (-1, 1) if neuron_dim == 0 else (1, -1)
+
             if fold_biases:
-                new_mlp_b_out = mlp_b_out + (mlp_W_out * mlp_ln_b[:, None]).sum(-2)
+                new_mlp_b_out = mlp_b_out + (mlp_W_out * mlp_ln_b.reshape(ln_shape)).sum(neuron_dim)
                 state_dict[mlp_b_out_key] = ProcessWeights.convert_tensor_to_hf_format(
                     mlp_b_out_key, new_mlp_b_out, cfg, adapter, layer
                 )
                 if mlp_ln_b_key in state_dict:
                     state_dict[mlp_ln_b_key] = torch.zeros_like(mlp_ln_b)
 
-            new_mlp_W_out = mlp_W_out * mlp_ln_w[:, None]
+            new_mlp_W_out = mlp_W_out * mlp_ln_w.reshape(ln_shape)
 
             if center_weights:
-                # Center along d_mlp dimension. Detect format:
-                # TL format [d_mlp, d_model] -> center along dim=0
-                # HF format [d_model, d_mlp] -> center along dim=-1
-                d_model_val = cfg.d_model if cfg is not None else None
-                if (
-                    d_model_val is not None
-                    and new_mlp_W_out.shape[-1] == d_model_val
-                    and new_mlp_W_out.shape[0] != d_model_val
-                ):
-                    new_mlp_W_out = new_mlp_W_out - new_mlp_W_out.mean(0, keepdim=True)
-                elif (
-                    d_model_val is not None
-                    and new_mlp_W_out.shape[0] == d_model_val
-                    and new_mlp_W_out.shape[-1] != d_model_val
-                ):
-                    new_mlp_W_out = new_mlp_W_out - new_mlp_W_out.mean(-1, keepdim=True)
-                else:
-                    new_mlp_W_out = new_mlp_W_out - new_mlp_W_out.mean(0, keepdim=True)
+                # The folded mid-MLP LayerNorm emits activations that are mean-zero across
+                # neurons, so a per-row constant along that axis never reaches the output.
+                new_mlp_W_out = new_mlp_W_out - new_mlp_W_out.mean(neuron_dim, keepdim=True)
 
             state_dict[mlp_W_out_key] = ProcessWeights.convert_tensor_to_hf_format(
                 mlp_W_out_key, new_mlp_W_out, cfg, adapter, layer
@@ -1130,9 +1190,11 @@ class ProcessWeights:
         Returns:
             Dict[str, torch.Tensor]: Modified state dict with centered writing weights.
         """
-        # Skip centering for Olmo2 models - input of attn of 1st layer is not normed
-        if getattr(cfg, "original_architecture", None) == "Olmo2ForCausalLM":
-            print("Not centering embedding weights for Olmo2ForCausalLM")
+        # Post-norm models leave the first attention's input un-normed, so centering
+        # the embedding would shift a residual stream nothing re-normalizes.
+        architecture = getattr(cfg, "original_architecture", None)
+        if architecture in POST_NORM_ARCHITECTURES:
+            print(f"Not centering embedding weights for {architecture}")
         else:
             # Make a deep copy to avoid modifying the original
             embed_W_E_key = ProcessWeights._get_param_key("embed.W_E", adapter)
@@ -1574,7 +1636,7 @@ class ProcessWeights:
         """Apply all weight processing transformations in the correct order.
 
         This is a convenience function that applies all the weight processing steps
-        in the same order as HookedTransformer.load_and_process_state_dict().
+        in the same order as the legacy HookedTransformer load path.
 
         Args:
             state_dict (Dict[str, torch.Tensor]): State dict of the model.

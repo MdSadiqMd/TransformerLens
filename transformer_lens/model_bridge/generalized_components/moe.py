@@ -5,9 +5,11 @@ This module contains the bridge component for Mixture of Experts layers.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Optional, Tuple
+import logging
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import torch
+from torch import nn
 
 from transformer_lens.hook_points import HookPoint
 from transformer_lens.model_bridge.generalized_components.base import (
@@ -18,6 +20,126 @@ from transformer_lens.model_bridge.generalized_components.mlp import (
     normalize_mlp_weight,
     weight_layout_in_out,
 )
+
+# transformers stores a whole expert stack in one 3-D Parameter under a fixed
+# vocabulary of names. The role has to come from the name: in the untransposed
+# layout down_proj is [n_experts, d_model, d_mlp], so its d_model axis is
+# indistinguishable by shape from an input projection's.
+_BATCHED_INPUT_PROJECTIONS = frozenset({"gate_up_proj", "gate_proj", "up_proj"})
+_BATCHED_OUTPUT_PROJECTIONS = frozenset({"down_proj"})
+_BATCHED_PROJECTIONS = _BATCHED_INPUT_PROJECTIONS | _BATCHED_OUTPUT_PROJECTIONS
+
+
+class UnfoldableMoEParameter(Exception):
+    """A parameter whose relationship to the MoE block's input cannot be established."""
+
+
+def unwrap_bridge(module: nn.Module) -> nn.Module:
+    """Descend through bridge wrappers to the module that owns the weights."""
+    while True:
+        original = getattr(module, "original_component", None)
+        if not isinstance(original, nn.Module):
+            return module
+        module = original
+
+
+def has_batched_experts(module: nn.Module) -> bool:
+    """Whether this MoE block stores its experts as batched 3-D Parameters.
+
+    Those parameters are not ``weight``/``bias`` leaves of a declared bridge
+    submodule, so ``TransformerBridge.state_dict()`` drops them and no state-dict
+    pass can reach them.
+    """
+    return any(
+        parameter.ndim == 3 and name.rpartition(".")[2] in _BATCHED_PROJECTIONS
+        for name, parameter in unwrap_bridge(module).named_parameters()
+    )
+
+
+def _input_axis(
+    owner: nn.Module, leaf: str, parameter: torch.Tensor, d_model: int
+) -> Optional[int]:
+    """Axis the block's input flows into, or None when the parameter never reads it.
+
+    Raises UnfoldableMoEParameter when the role cannot be established, so the caller
+    can decline rather than guess — a fold that misses one reader is silently wrong.
+    """
+    if leaf == "bias" or leaf.endswith("_bias"):
+        return None  # folding a norm's gain never touches a downstream bias
+    if parameter.ndim == 1:
+        raise UnfoldableMoEParameter(
+            f"{leaf}: 1-D weight inside the MoE block looks like a normalization gain, "
+            "which would re-normalize away the scale being folded"
+        )
+    if parameter.ndim == 2:
+        in_features = getattr(owner, "in_features", None)
+        if in_features is not None:
+            return -1 if in_features == d_model else None
+        # Routers hold a bare Parameter and consume it through F.linear, i.e. [out, in].
+        if parameter.shape[0] == d_model and parameter.shape[-1] != d_model:
+            raise UnfoldableMoEParameter(
+                f"{leaf}: 2-D {tuple(parameter.shape)} on {type(owner).__name__} has "
+                "d_model on the output axis, so its orientation is not F.linear's"
+            )
+        if parameter.shape[-1] != d_model:
+            return None
+        if parameter.shape[0] == d_model:
+            raise UnfoldableMoEParameter(f"{leaf}: square {tuple(parameter.shape)} is ambiguous")
+        return -1
+    if parameter.ndim == 3:
+        if leaf in _BATCHED_OUTPUT_PROJECTIONS:
+            return None  # reads the expert intermediate, not the block input
+        if leaf not in _BATCHED_INPUT_PROJECTIONS:
+            raise UnfoldableMoEParameter(f"{leaf}: unrecognized batched expert parameter")
+        transposed = getattr(owner, "is_transposed", None)
+        if transposed is not None:
+            axis = 1 if transposed else -1
+            if parameter.shape[axis] != d_model:
+                raise UnfoldableMoEParameter(
+                    f"{leaf}: {tuple(parameter.shape)} has no d_model on the axis "
+                    f"is_transposed={transposed} implies"
+                )
+            return axis
+        # A few experts classes (Llama4) predate the layout flag; fall back to shape.
+        candidates = [axis for axis in (1, -1) if parameter.shape[axis] == d_model]
+        if len(candidates) != 1:
+            raise UnfoldableMoEParameter(
+                f"{leaf}: {type(owner).__name__} declares no is_transposed and "
+                f"{tuple(parameter.shape)} does not pin d_model to one axis"
+            )
+        return candidates[0]
+    raise UnfoldableMoEParameter(f"{leaf}: unexpected {parameter.ndim}-D parameter")
+
+
+def fold_scale_into_moe_block(module: nn.Module, scale: torch.Tensor) -> bool:
+    """Scale every parameter of a MoE block that reads the block's input, in place.
+
+    Routed experts, shared experts and the router all read the preceding norm's
+    output; only the down-projections read the expert intermediate. Returns False
+    without touching anything when any parameter's role is unclear, because a fold
+    that reaches some readers and not others changes what the model computes.
+    """
+    block = unwrap_bridge(module)
+    d_model = int(scale.shape[0])
+    plan: List[Tuple[torch.Tensor, int]] = []
+    try:
+        for name, parameter in block.named_parameters():
+            prefix, _, leaf = name.rpartition(".")
+            owner = block.get_submodule(prefix) if prefix else block
+            axis = _input_axis(owner, leaf, parameter, d_model)
+            if axis is not None:
+                plan.append((parameter, axis))
+    except UnfoldableMoEParameter as reason:
+        logging.warning("Not folding the layer norm into %s: %s", type(block).__name__, reason)
+        return False
+    if not plan:
+        return False
+    with torch.no_grad():
+        for target, axis in plan:
+            shape = [1] * target.ndim
+            shape[axis] = d_model
+            target.mul_(scale.reshape(shape).to(dtype=target.dtype, device=target.device))
+    return True
 
 
 class MoEBridge(GeneralizedComponent):
@@ -91,6 +213,28 @@ class MoEBridge(GeneralizedComponent):
                 f"submodules (declared: {sorted(submodules or {})})"
             )
         self._sparse_required = sparse_required
+        # HookedTransformer exposes the routing observables on the MoE block
+        # itself; the bridge fires them on the router submodule, whose adapter
+        # key differs ("gate" on 5.13 SparseMoeBlocks, "router" on GPT-OSS).
+        # Alias so code migrated from HT finds them under the HT name.
+        self._router_hook_aliases = self._build_router_hook_aliases(submodules or {})
+        self.hook_aliases = {**self.hook_aliases, **self._router_hook_aliases}
+
+    @staticmethod
+    def _build_router_hook_aliases(
+        submodules: Mapping[str, GeneralizedComponent],
+    ) -> Dict[str, str]:
+        """Map HT's block-level routing hook names onto the router submodule."""
+        aliases: Dict[str, str] = {}
+        for key, component in submodules.items():
+            if not isinstance(component, MoERouterBridge):
+                continue
+            if component.weights_index is not None:
+                aliases["hook_expert_weights"] = f"{key}.hook_expert_weights"
+            if component.indices_index is not None:
+                aliases["hook_expert_indices"] = f"{key}.hook_expert_indices"
+            break
+        return aliases
 
     def _binds_dense_projections(self, component: torch.nn.Module) -> bool:
         """Whether this layer is the dense variant of an interleaved MoE stack.
@@ -160,7 +304,7 @@ class MoEBridge(GeneralizedComponent):
                 del self.hook_router_scores
         else:
             # Symmetric restore so a rebinding harness cannot leave a chimera.
-            self.hook_aliases = dict(type(self).hook_aliases)
+            self.hook_aliases = {**type(self).hook_aliases, **self._router_hook_aliases}
             self.property_aliases = {
                 key: value
                 for key, value in self.property_aliases.items()
@@ -281,28 +425,11 @@ class MoEBridge(GeneralizedComponent):
             raise RuntimeError(
                 f"Original component not set for {self.name}. Call set_original_component() first."
             )
-        target_dtype = None
-        try:
-            target_dtype = next(self.original_component.parameters()).dtype
-        except StopIteration:
-            pass
         if len(args) > 0:
             hooked = self.hook_in(args[0])
-            if (
-                target_dtype is not None
-                and isinstance(hooked, torch.Tensor)
-                and hooked.is_floating_point()
-            ):
-                hooked = hooked.to(dtype=target_dtype)
             args = (hooked,) + args[1:]
         elif "hidden_states" in kwargs:
             hooked = self.hook_in(kwargs["hidden_states"])
-            if (
-                target_dtype is not None
-                and isinstance(hooked, torch.Tensor)
-                and hooked.is_floating_point()
-            ):
-                hooked = hooked.to(dtype=target_dtype)
             kwargs = {**kwargs, "hidden_states": hooked}
         output = self.original_component(*args, **kwargs)
         if isinstance(output, tuple):
@@ -346,11 +473,37 @@ class MoERouterBridge(LinearBridge):
     5.13 TopKRouters return ``(router_logits, topk_weights, topk_indices)``;
     hook_out fires on the logits (element ``logits_index`` — JetMoe puts them
     last) and the tuple is re-packed so HF's unpacking is undisturbed.
+
+    ``hook_expert_weights`` / ``hook_expert_indices`` mirror the HookedTransformer
+    MoE routing hooks. HF routers hand back top-k-shaped weights
+    ``[tokens, top_k]``, so the weights are scattered to HT's
+    ``[tokens, num_experts]`` before firing and gathered back afterwards — an
+    unedited round trip returns the values bit-for-bit. Any weight edit
+    re-derives the top-k selection from the edited tensor, so boosting a
+    suppressed expert re-routes the token (HT's pre-top-k contract); unlike
+    HT's mixtral component, edited weights are used as-is with no
+    renormalization after the hook.
     """
 
-    def __init__(self, *args: Any, logits_index: int = 0, **kwargs: Any):
+    def __init__(
+        self,
+        *args: Any,
+        logits_index: int = 0,
+        weights_index: Optional[int] = 1,
+        indices_index: Optional[int] = 2,
+        **kwargs: Any,
+    ):
         super().__init__(*args, **kwargs)
         self.logits_index = logits_index
+        self.weights_index = weights_index
+        self.indices_index = indices_index
+        # None means this router's tuple has no clean [tokens, top_k] pair
+        # (JetMoe returns a sorted-expert layout); registering the hook anyway
+        # would advertise an intervention point that can never fire.
+        if weights_index is not None:
+            self.hook_expert_weights = HookPoint()
+        if indices_index is not None:
+            self.hook_expert_indices = HookPoint()
 
     def forward(self, input: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
         if self.original_component is None:
@@ -361,9 +514,88 @@ class MoERouterBridge(LinearBridge):
         output = self.original_component(input, *args, **kwargs)
         if not isinstance(output, tuple) or len(output) == 0:
             return self.hook_out(output)
-        idx = self.logits_index % len(output)
-        router_logits = self.hook_out(output[idx])
-        return output[:idx] + (router_logits,) + output[idx + 1 :]
+        parts = list(output)
+        count = len(parts)
+        logits_at = self.logits_index % count
+        parts[logits_at] = self.hook_out(parts[logits_at])
+
+        weights_at = None if self.weights_index is None else self.weights_index % count
+        indices_at = None if self.indices_index is None else self.indices_index % count
+        if weights_at is None and indices_at is None:
+            return tuple(parts)
+
+        indices = None if indices_at is None else parts[indices_at]
+        expanded = None
+        if weights_at is not None:
+            scattered = self._expand_expert_weights(parts[weights_at], indices, parts[logits_at])
+            expanded = self.hook_expert_weights(scattered)
+            if (
+                indices is not None
+                and expanded.shape != parts[weights_at].shape
+                and not torch.equal(expanded, scattered)
+            ):
+                # An edit outside the current top-k would otherwise be discarded
+                # by the gather below (those columns have no downstream reader in
+                # the [tokens, top_k] layout). Re-derive the selection from the
+                # edited tensor so boosting a suppressed expert re-routes, as it
+                # does on HookedTransformer's pre-top-k hook. The edited values
+                # are used as-is — no per-arch renormalization is re-applied.
+                _, new_indices = torch.topk(expanded, indices.shape[-1], dim=-1)
+                indices = new_indices.to(indices.dtype)
+                if indices_at is not None:
+                    parts[indices_at] = indices
+        if indices_at is not None:
+            indices = self.hook_expert_indices(indices)
+            parts[indices_at] = indices
+        if weights_at is not None:
+            # Gathered after the indices hook so re-routing picks up the weight
+            # sitting at the newly selected expert, as HookedTransformer does.
+            parts[weights_at] = self._collapse_expert_weights(expanded, indices, parts[weights_at])
+        return tuple(parts)
+
+    def _expand_expert_weights(
+        self,
+        weights: torch.Tensor,
+        indices: Optional[torch.Tensor],
+        logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Scatter top-k weights into HT's ``[tokens, num_experts]`` layout."""
+        if not self._is_top_k_shaped(weights, indices, logits):
+            return weights
+        assert indices is not None
+        scattered = torch.zeros(
+            (*weights.shape[:-1], logits.shape[-1]),
+            dtype=weights.dtype,
+            device=weights.device,
+        )
+        scattered.scatter_(-1, indices.long(), weights)
+        return scattered
+
+    def _collapse_expert_weights(
+        self,
+        expanded: Optional[torch.Tensor],
+        indices: Optional[torch.Tensor],
+        original: torch.Tensor,
+    ) -> torch.Tensor:
+        """Gather the expanded weights back to the top-k layout HF expects."""
+        if expanded is None or indices is None or expanded.shape == original.shape:
+            return expanded if expanded is not None else original
+        return expanded.gather(-1, indices.long())
+
+    @staticmethod
+    def _is_top_k_shaped(
+        weights: torch.Tensor,
+        indices: Optional[torch.Tensor],
+        logits: torch.Tensor,
+    ) -> bool:
+        """Whether the weights are the top-k slice rather than full expert width."""
+        return (
+            indices is not None
+            and isinstance(weights, torch.Tensor)
+            and isinstance(logits, torch.Tensor)
+            and weights.shape == indices.shape
+            and weights.shape[-1] != logits.shape[-1]
+        )
 
     def set_processed_weights(
         self, weights: Mapping[str, Optional[torch.Tensor]], verbose: bool = False

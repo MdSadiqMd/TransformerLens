@@ -60,8 +60,9 @@ References:
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass
-from typing import List
+from typing import Callable, Dict, List, Tuple
 
 import torch
 
@@ -92,6 +93,58 @@ _GRADIENT_BACKTRACK_STEPS = 20
 #: selected support scale-invariant. It is deliberately coarser than the activity threshold:
 #: selection is a float32 correlation decision, activity a check against the float64 solve.
 _CORRELATION_RELATIVE_TOLERANCE = math.sqrt(torch.finfo(torch.float32).eps)
+
+#: Shared near-parallel policy for lens-space interventions. Two atoms whose absolute cosine
+#: reaches this threshold span an ill-conditioned pair: a coordinate swap between them is
+#: approximately a no-op. Both the anchored coordinate patch and ``JacobianLens.swap_hooks``
+#: read this one definition so their near-parallel diagnostics never drift apart.
+_SWAP_WARN_COSINE = 0.99
+#: Above this cosine ``swap_hooks`` refuses the intervention: inverting a two-atom basis whose
+#: columns are near-collinear is numerically hopeless. The anchored coordinate patch inverts
+#: nothing, so it only reads ``_SWAP_WARN_COSINE`` and never raises on this threshold.
+_SWAP_ERROR_COSINE = 0.999
+
+
+def _linalg_on_cpu_if_mps(op: Callable[..., torch.Tensor], *tensors: torch.Tensor) -> torch.Tensor:
+    """Run a linear-algebra op that MPS lacks a kernel for, restoring the input device.
+
+    Several LAPACK-backed ``torch.linalg`` routines (``pinv``, ``svdvals``) are unimplemented on
+    the MPS backend, so callers must round-trip through CPU. This centralizes the shared
+    detect-device -> ``.cpu()`` -> op -> restore idiom: off MPS ``op`` is called on the input
+    tensors unchanged, and on MPS it is called on their CPU copies with the result moved back to
+    the input device. All inputs must share one device.
+    """
+    device = tensors[0].device
+    if device.type == "mps":
+        return op(*(tensor.cpu() for tensor in tensors)).to(device)
+    return op(*tensors)
+
+
+def _diagnose_intervention_pair(
+    unit_vectors: torch.Tensor, *, description: str, stacklevel: int
+) -> float:
+    """Apply the shared near-parallel warn/raise policy to two unit-normalized vectors.
+
+    Returns the signed cosine. Warns above :data:`_SWAP_WARN_COSINE` and raises above
+    :data:`_SWAP_ERROR_COSINE`. Used by interventions that invert a two-atom basis (e.g.
+    ``swap_hooks``); the anchored coordinate patch, which performs no inverse, warns without
+    raising and does not call this helper.
+    """
+    cosine = float((unit_vectors[0] @ unit_vectors[1]).item())
+    abs_cosine = abs(cosine)
+    if not math.isfinite(abs_cosine) or abs_cosine >= _SWAP_ERROR_COSINE:
+        raise ValueError(
+            f"{description} are numerically near-parallel "
+            f"(abs cosine={abs_cosine:.6f}); choose better-separated concepts"
+        )
+    if abs_cosine >= _SWAP_WARN_COSINE:
+        warnings.warn(
+            f"{description} are poorly conditioned "
+            f"(abs cosine={abs_cosine:.6f}); the intervention may be amplified",
+            UserWarning,
+            stacklevel=stacklevel,
+        )
+    return cosine
 
 
 @dataclass
@@ -201,8 +254,8 @@ def _nonnegative_least_squares(active_atoms: torch.Tensor, target: torch.Tensor)
     result_dtype = target.dtype
     result_device = target.device
     work_device = torch.device("cpu") if target.device.type == "mps" else target.device
-    work_atoms = active_atoms.to(device=work_device, dtype=torch.float64)
-    work_target = target.to(device=work_device, dtype=torch.float64)
+    work_atoms = active_atoms.to(device=work_device).to(dtype=torch.float64)
+    work_target = target.to(device=work_device).to(dtype=torch.float64)
     if not bool(torch.isfinite(work_atoms).all()) or not bool(torch.isfinite(work_target).all()):
         raise ValueError("active_atoms and target must contain only finite values")
 
@@ -435,7 +488,11 @@ def get_sparse_decomposition(
     # swap_hooks. That span can be larger than the active support when a selected coordinate is
     # zero, so the projection differs from the nonnegative reconstruction in that case.
     if selected:
-        j_space_component = selected_atoms @ (torch.linalg.pinv(selected_atoms) @ target)
+        j_space_component = _linalg_on_cpu_if_mps(
+            lambda atoms, vector: atoms @ (torch.linalg.pinv(atoms) @ vector),
+            selected_atoms,
+            target,
+        )
     else:
         j_space_component = target.new_zeros(d_model)
     non_j_space_component = target - j_space_component
@@ -447,3 +504,174 @@ def get_sparse_decomposition(
         j_space_component=j_space_component,
         non_j_space_component=non_j_space_component,
     )
+
+
+@dataclass
+class JSpaceOccupancy:
+    """Result of a J-space occupancy estimate.
+
+    Attributes:
+        occupancy: Estimated number of meaningfully-active atoms -- the step of maximum
+            separation between the real and random-control cumulative captured variance.
+        marginal_captured_variance: Per-step captured-variance gain of the real greedy selection,
+            shape ``[max_atoms]``.
+        control_captured_variance: Per-step captured-variance gain averaged over the random
+            control dictionaries, shape ``[max_atoms]``.
+        support: Greedily selected atom indices, shape ``[max_atoms]`` (token ids when the
+            dictionary is the vocabulary of J-lens vectors).
+    """
+
+    occupancy: int
+    marginal_captured_variance: torch.Tensor
+    control_captured_variance: torch.Tensor
+    support: torch.Tensor
+
+
+def _greedy_captured_variance_gains(
+    atoms: torch.Tensor, atom_norms: torch.Tensor, target: torch.Tensor, max_atoms: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Greedily select exactly ``max_atoms`` atoms and return captured-variance gains.
+
+    At each step, add the unused atom with the greatest signed, norm-normalized correlation with
+    the current residual. Project ``target`` orthogonally onto the full selected span using a
+    pseudoinverse, then set the next residual to ``target - projection``. The captured variance is
+    ``||Pi_S target||^2 / ||target||^2``; the returned values are its per-step increments.
+
+    This shares the per-step correlation rule with :func:`get_sparse_decomposition`, but not its
+    residual recurrence: sparse decomposition uses a nonnegative coefficient-fit residual and may
+    stop early, while this recurrence does not stop early, so the selected supports can differ.
+    """
+    total_variance = float(target @ target)
+    support: List[int] = []
+    residual = target.clone()
+    captured_variance_gains: List[float] = []
+    previous_captured_variance = 0.0
+    for _ in range(max_atoms):
+        correlation = (atoms @ residual) / atom_norms
+        for chosen in support:
+            correlation[chosen] = float("-inf")
+        support.append(int(torch.argmax(correlation).item()))
+        active_atoms = atoms[support].T
+        projection = active_atoms @ (torch.linalg.pinv(active_atoms) @ target)
+        captured_variance = float((projection @ projection) / total_variance)
+        captured_variance_gains.append(captured_variance - previous_captured_variance)
+        previous_captured_variance = captured_variance
+        residual = target - projection
+    return torch.tensor(captured_variance_gains), torch.tensor(support, dtype=torch.long)
+
+
+def estimate_occupancy(
+    x: torch.Tensor,
+    dictionary: torch.Tensor,
+    *,
+    max_atoms: int = DEFAULT_K,
+    num_control_dictionaries: int = 32,
+    seed: int = 0,
+) -> JSpaceOccupancy:
+    """Estimate how many dictionary atoms are meaningfully active in ``x``.
+
+    Runs the projection-residual recurrence described in
+    :func:`_greedy_captured_variance_gains` for exactly ``max_atoms`` steps and compares the real
+    per-step captured-variance curve against the same recurrence on ``num_control_dictionaries``
+    random unit-norm dictionaries of the same size. This shares sparse decomposition's per-step
+    correlation rule, but uses an unconstrained span-projection residual rather than a nonnegative
+    coefficient-fit residual, so their supports need not match. The occupancy is the step of
+    maximum separation between the real and (averaged) control *cumulative* captured variance --
+    the point past which further atoms add no more than random directions would. Deterministic
+    given ``seed`` and needs no threshold. (Captured variance is a projection, hence scale-free,
+    so the random control atoms are simply unit-norm.)
+
+    Args:
+        x: Target vector, shape ``[d_model]``.
+        dictionary: Atom matrix, shape ``[num_atoms, d_model]`` (rows are atoms).
+        max_atoms: Number of atoms to select in the real and control recurrences.
+        num_control_dictionaries: Number of random control dictionaries to average over.
+        seed: Seed for the random control dictionaries (reproducibility).
+
+    Returns:
+        An :class:`JSpaceOccupancy`.
+
+    Raises:
+        ValueError: On complex inputs, a non-2-D dictionary, a target whose length does not match
+            ``d_model``, ``max_atoms`` outside ``[1, num_atoms]``,
+            ``num_control_dictionaries < 1``, a target with non-finite entries or a non-finite or
+            zero norm, or a dictionary with non-finite or zero-norm atoms.
+    """
+    if dictionary.ndim != 2:
+        raise ValueError(
+            f"dictionary must be 2-D [num_atoms, d_model], got shape {tuple(dictionary.shape)}"
+        )
+    num_atoms, d_model = dictionary.shape
+    if x.ndim != 1 or x.shape[0] != d_model:
+        raise ValueError(f"x must be 1-D of length d_model={d_model}, got shape {tuple(x.shape)}")
+    if not 1 <= max_atoms <= num_atoms:
+        raise ValueError(f"max_atoms must be between 1 and num_atoms={num_atoms}, got {max_atoms}")
+    if num_control_dictionaries < 1:
+        raise ValueError(
+            f"num_control_dictionaries must be at least 1, got {num_control_dictionaries}"
+        )
+    if torch.is_complex(x) or torch.is_complex(dictionary):
+        raise ValueError("x and dictionary must be real-valued")
+
+    target = x.float()
+    atoms = dictionary.float()
+    if not bool(torch.isfinite(target).all()):
+        raise ValueError("x contains non-finite entries")
+    target_squared_norm = target @ target
+    if not bool(torch.isfinite(target_squared_norm)):
+        raise ValueError("x must have finite norm")
+    if float(target_squared_norm) <= 0.0:
+        raise ValueError("x must have non-zero norm")
+    if not bool(torch.isfinite(atoms).all()):
+        raise ValueError("dictionary contains non-finite entries")
+    atom_norms = (atoms * atoms).sum(dim=1).sqrt()
+    if not bool(torch.isfinite(atom_norms).all()) or bool((atom_norms == 0).any()):
+        raise ValueError("dictionary contains a non-finite or zero-norm atom")
+
+    real_captured_variance, support = _greedy_captured_variance_gains(
+        atoms, atom_norms, target, max_atoms
+    )
+
+    generator = torch.Generator(device=atoms.device).manual_seed(seed)
+    control_atom_norms = torch.ones(num_atoms, device=atoms.device)
+    control_variance_runs: List[torch.Tensor] = []
+    for _ in range(num_control_dictionaries):
+        random_atoms = torch.randn(
+            num_atoms, d_model, generator=generator, device=atoms.device, dtype=atoms.dtype
+        )
+        random_atoms = random_atoms / (random_atoms * random_atoms).sum(dim=1, keepdim=True).sqrt()
+        control_run_variance, _ = _greedy_captured_variance_gains(
+            random_atoms, control_atom_norms, target, max_atoms
+        )
+        control_variance_runs.append(control_run_variance)
+    control_captured_variance = torch.stack(control_variance_runs).mean(dim=0)
+
+    separation = real_captured_variance.cumsum(dim=0) - control_captured_variance.cumsum(dim=0)
+    occupancy = int(torch.argmax(separation).item()) + 1
+    return JSpaceOccupancy(
+        occupancy=occupancy,
+        marginal_captured_variance=real_captured_variance,
+        control_captured_variance=control_captured_variance,
+        support=support,
+    )
+
+
+@dataclass
+class JSpaceVarianceProfile:
+    """Per-layer J-space variance profile over a prompt corpus.
+
+    Produced by :meth:`JacobianLens.fraction_of_variance`.
+
+    Attributes:
+        layers: The source layers profiled, in order.
+        median: Per-layer median over positions of the J-space variance fraction
+            ``||j_space_component||^2 / ||activation||^2``.
+        pooled: Per-layer pooled ratio ``sum(||j_space_component||^2) / sum(||activation||^2)``
+            across the corpus (the paper's "fraction of total variance").
+        per_position: Per-layer 1-D tensor of the raw per-position variance fractions.
+    """
+
+    layers: List[int]
+    median: Dict[int, float]
+    pooled: Dict[int, float]
+    per_position: Dict[int, torch.Tensor]

@@ -217,6 +217,7 @@ class HookPoint(nn.Module):
                 # Call the hook once for each alias name
                 # Create a simple wrapper that acts like a HookPoint but with a different name
                 hook_result = None
+                hook_changed_output = False
                 for alias_name in alias_names:
                     # Create a view of this HookPoint with the alias name
                     hook_with_alias = _AliasedHookPoint(alias_name, self)
@@ -225,6 +226,9 @@ class HookPoint(nn.Module):
                     # If the hook modified the output, use that for subsequent calls
                     if hook_result is not None:
                         module_output = hook_result
+                        hook_changed_output = True
+                if hook_changed_output:
+                    hook_result = module_output
             else:
                 # Call the hook once with the canonical name (self)
                 hook_result = hook(module_output, hook=self)
@@ -371,7 +375,7 @@ class HookPoint(nn.Module):
 
     def layer(self):
         # Returns the layer index if the name has the form 'blocks.{layer}.{...}'
-        # Helper function that's mainly useful on HookedTransformer
+        # Helper for models whose hook names follow the blocks.{layer}.* scheme
         # If it doesn't have this form, raises an error -
         if self.name is None:
             raise ValueError("Name cannot be None")
@@ -428,20 +432,15 @@ class HookIntrospectionMixin:
         return out
 
 
-# HookedRootModule moved to transformer_lens.HookedRootModule (3.0). Import it from
-# its dedicated module. Importing from here is deprecated and will trigger a warning.
+# HookedRootModule moved to transformer_lens.HookedRootModule in 3.0; the
+# deprecated re-export from here was removed in 4.0 as promised. The class itself
+# is kept — import it from transformer_lens or transformer_lens.HookedRootModule.
 def __getattr__(name: str):
     if name == "HookedRootModule":
-        import warnings
-
-        from transformer_lens.HookedRootModule import HookedRootModule
-
-        warnings.warn(
-            "Importing HookedRootModule from transformer_lens.hook_points is "
-            "deprecated and will be removed in TransformerLens 4.0. Import it from "
-            "transformer_lens (preferred) or transformer_lens.HookedRootModule instead.",
-            DeprecationWarning,
-            stacklevel=2,
+        raise AttributeError(
+            "Importing HookedRootModule from transformer_lens.hook_points was "
+            "removed in TransformerLens 4.0. Import it from transformer_lens "
+            "(preferred) or transformer_lens.HookedRootModule instead — the class "
+            "itself is kept."
         )
-        return HookedRootModule
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

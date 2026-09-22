@@ -85,9 +85,9 @@ class BlockBridge(GeneralizedComponent):
                 auto_overrides["hook_mlp_out"] = "ln2_post.hook_out"
         merged_overrides = {**auto_overrides, **(hook_alias_overrides or {})}
 
-        # Guard the sequential-block case: attn + mlp with no ln2 would silently
-        # point hook_resid_mid at the wrong tensor. Use ParallelBlockBridge for
-        # parallel-residual architectures.
+        # Guard against the bug where a sequential block (attn + mlp) with no ln2
+        # silently points hook_resid_mid at the wrong tensor. Use
+        # ParallelBlockBridge for parallel-residual architectures.
         # Skip the check on generic-container / attn-only uses (no mlp).
         has_attn_like = submodules is not None and any(
             k in submodules for k in _VARIANT_SUBMODULE_SET
@@ -101,7 +101,6 @@ class BlockBridge(GeneralizedComponent):
                 f"parallel-residual architecture."
             )
 
-        # Call parent with merged overrides
         super().__init__(
             name,
             config,
@@ -119,12 +118,35 @@ class BlockBridge(GeneralizedComponent):
         # blocks) when use_hook_mlp_in is set. See #1317.
         self.hook_mlp_in = HookPoint()
 
+    def _wire_ln1_module(self) -> None:
+        """Keep the raw ln1 execution reference outside the ownership tree."""
+        from transformer_lens.model_bridge.generalized_components.attention import (
+            AttentionBridge,
+        )
+
+        ln1 = self.submodules.get("ln1") if self.submodules else None
+        attn = self.submodules.get("attn") if self.submodules else None
+        if not isinstance(attn, AttentionBridge):
+            return
+
+        ln1_module = None
+        if (
+            ln1 is not None
+            and getattr(attn, "supports_split_qkv_fork", False)
+            and getattr(ln1, "original_component", None) is not None
+        ):
+            ln1_module = ln1.original_component
+
+        attn._modules.pop("_ln1_module", None)
+        object.__setattr__(attn, "_ln1_module", ln1_module)
+
     def _maybe_wire_capture_hooks(self) -> None:
         """Install the block's capture hooks (split-qkv fork, hook_mlp_in).
 
         Registered on the bridge submodule, not ``original_component`` — the
         manual bridge forward never calls the raw module. Idempotent.
         """
+        self._wire_ln1_module()
         if self._capture_hooks_wired:
             return
         from transformer_lens.model_bridge.generalized_components.attention import (
@@ -147,7 +169,6 @@ class BlockBridge(GeneralizedComponent):
 
             handle = ln1.register_forward_pre_hook(_capture_pre_ln1)
             self._capture_hook_handles.append(handle)
-            attn._ln1_module = ln1.original_component
 
         # hook_mlp_in must capture the MLP-branch entry point: ln2's input on
         # pre-norm blocks, the MLP's own input on post-norm blocks (where ln2
@@ -190,6 +211,16 @@ class BlockBridge(GeneralizedComponent):
             return bool(cfg.use_hook_mlp_in)
         return self._use_hook_mlp_in
 
+    def _clear_attention_capture(self) -> None:
+        """Release the transient residual captured for attention input forks."""
+        from transformer_lens.model_bridge.generalized_components.attention import (
+            AttentionBridge,
+        )
+
+        attn = self.submodules.get("attn") if self.submodules else None
+        if isinstance(attn, AttentionBridge):
+            attn._captured_pre_ln_residual = None
+
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         """Forward pass through the block bridge.
 
@@ -209,6 +240,8 @@ class BlockBridge(GeneralizedComponent):
             )
 
         self._maybe_wire_capture_hooks()
+        self._clear_attention_capture()
+        args, kwargs = self._maybe_inject_start_residual(args, kwargs)
         self._check_stop_at_layer(*args, **kwargs)
         args, kwargs = self._hook_input_hidden_states(args, kwargs)
 
@@ -216,7 +249,10 @@ class BlockBridge(GeneralizedComponent):
         # This prevents errors when passing encoder-specific params to decoder-only models
         filtered_kwargs = self._filter_kwargs_for_forward(kwargs, len(args))
 
-        output = self.original_component(*args, **filtered_kwargs)
+        try:
+            output = self.original_component(*args, **filtered_kwargs)
+        finally:
+            self._clear_attention_capture()
         force_tuple_for_bare_tensor = self._is_standalone_hidden_state_call(args, filtered_kwargs)
         return self._apply_output_hook(
             output, force_tuple_for_bare_tensor=force_tuple_for_bare_tensor
@@ -272,35 +308,53 @@ class BlockBridge(GeneralizedComponent):
             and isinstance(kwargs["hidden_states"], torch.Tensor)
         )
 
+    def _extract_layer_idx(self) -> Optional[int]:
+        """Parse this block's layer index from its name (TL/GPT-2/LLaMA patterns)."""
+        if self.name is None:
+            return None
+        match = re.search(r"(?:^|\.)(?:blocks|h|layers)\.(\d+)", self.name)
+        return int(match.group(1)) if match else None
+
     def _check_stop_at_layer(self, *args: Any, **kwargs: Any) -> None:
         """Check if execution should stop before this block. Raises StopAtLayerException.
 
         The _stop_at_layer_idx attribute is set by the bridge's forward method.
         Supports TL/GPT-2/LLaMA naming patterns for layer index extraction.
         """
-        if not (hasattr(self, "_stop_at_layer_idx") and self._stop_at_layer_idx is not None):
+        if getattr(self, "_stop_at_layer_idx", None) is None:
             return
-        if self.name is not None:
-            match = (
-                re.search(r"blocks\.(\d+)", self.name)
-                or re.search(r"\.h\.(\d+)", self.name)
-                or re.search(r"\.layers\.(\d+)", self.name)
-            )
-        else:
-            match = None
-        if match:
-            layer_idx = int(match.group(1))
-            if layer_idx == self._stop_at_layer_idx:
-                if len(args) > 0 and isinstance(args[0], torch.Tensor):
-                    input_tensor = args[0]
-                elif "hidden_states" in kwargs and isinstance(
-                    kwargs["hidden_states"], torch.Tensor
-                ):
-                    input_tensor = kwargs["hidden_states"]
-                else:
-                    raise ValueError(f"Cannot find input tensor to stop at layer {layer_idx}")
-                input_tensor = self.hook_in(input_tensor)
-                raise StopAtLayerException(input_tensor)
+        layer_idx = self._extract_layer_idx()
+        if layer_idx is not None and layer_idx == self._stop_at_layer_idx:
+            if len(args) > 0 and isinstance(args[0], torch.Tensor):
+                input_tensor = args[0]
+            elif "hidden_states" in kwargs and isinstance(kwargs["hidden_states"], torch.Tensor):
+                input_tensor = kwargs["hidden_states"]
+            else:
+                raise ValueError(f"Cannot find input tensor to stop at layer {layer_idx}")
+            input_tensor = self.hook_in(input_tensor)
+            raise StopAtLayerException(input_tensor)
+
+    def _maybe_inject_start_residual(self, args: tuple, kwargs: dict) -> tuple[tuple, dict]:
+        """If this is the start_at_layer block, swap in the caller's residual.
+
+        Mirror of ``_check_stop_at_layer``: the bridge's forward stashes the
+        residual-stream input on the block via ``_start_residual`` and sets
+        ``_start_at_layer_idx``. This block replaces its incoming hidden states
+        with that residual; ``_hook_input_hidden_states`` then fires ``hook_in``
+        on it, so ``hook_resid_pre`` reflects the injected value.
+        """
+        if getattr(self, "_start_at_layer_idx", None) is None:
+            return args, kwargs
+        if self._extract_layer_idx() != self._start_at_layer_idx:
+            return args, kwargs
+        residual = getattr(self, "_start_residual", None)
+        if residual is None:
+            return args, kwargs
+        if len(args) > 0 and isinstance(args[0], torch.Tensor):
+            args = (residual,) + args[1:]
+        elif "hidden_states" in kwargs:
+            kwargs = {**kwargs, "hidden_states": residual}
+        return args, kwargs
 
     def _hook_input_hidden_states(self, args: tuple, kwargs: dict) -> tuple[tuple, dict]:
         """Apply hook_in to the hidden_states input, whether in args or kwargs."""

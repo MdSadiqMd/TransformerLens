@@ -1,13 +1,13 @@
 """Hook registration and behavior benchmarks for TransformerBridge."""
 
-from typing import Dict, Optional
+from typing import Dict, Iterable, Optional
 
 import torch
 
-from transformer_lens import HookedTransformer
 from transformer_lens.benchmarks.utils import (
     BenchmarkResult,
     BenchmarkSeverity,
+    bridge_self_target_loss,
     compare_activation_dicts,
     compare_scalars,
     filter_expected_missing_hooks,
@@ -19,19 +19,20 @@ from transformer_lens.model_bridge import TransformerBridge
 
 def benchmark_hook_registry(
     bridge: TransformerBridge,
-    reference_model: Optional[HookedTransformer] = None,
+    reference_hooks: Optional[Iterable[str]] = None,
 ) -> BenchmarkResult:
     """Benchmark hook registry completeness.
 
     Args:
         bridge: TransformerBridge model to test
-        reference_model: Optional HookedTransformer reference model
+        reference_hooks: Optional reference hook-name collection (e.g. the keys of
+            a golden hook manifest). Structural self-check only if None.
 
     Returns:
         BenchmarkResult with registry comparison details
     """
     try:
-        if reference_model is None:
+        if reference_hooks is None:
             # No reference - just verify hooks exist
             if not hasattr(bridge, "_hook_registry"):
                 return BenchmarkResult(
@@ -56,13 +57,13 @@ def benchmark_hook_registry(
                 details={"hook_count": hook_count},
             )
 
-        # Compare with reference model
+        # Compare with the reference hook-name set
         bridge_hooks = set(bridge.hook_dict.keys())
-        reference_hooks = set(reference_model.hook_dict.keys())
+        reference_hook_set = set(reference_hooks)
 
-        common_hooks = bridge_hooks & reference_hooks
-        missing_hooks = reference_hooks - bridge_hooks
-        extra_hooks = bridge_hooks - reference_hooks
+        common_hooks = bridge_hooks & reference_hook_set
+        missing_hooks = reference_hook_set - bridge_hooks
+        extra_hooks = bridge_hooks - reference_hook_set
 
         # Filter out hooks that are expected to differ due to architectural differences.
         if missing_hooks:
@@ -83,14 +84,14 @@ def benchmark_hook_registry(
             )
 
         # Bridge having extra hooks is fine - it just means Bridge has more granular hooks
-        # What matters is that all HookedTransformer hooks are present in Bridge
+        # What matters is that every reference hook is present in Bridge
         return BenchmarkResult(
             name="hook_registry",
             severity=BenchmarkSeverity.INFO,
-            message=f"All {len(reference_hooks)} reference hooks present in Bridge"
+            message=f"All {len(reference_hook_set)} reference hooks present in Bridge"
             + (f" (Bridge has {len(extra_hooks)} additional hooks)" if extra_hooks else ""),
             details={
-                "reference_hooks": len(reference_hooks),
+                "reference_hooks": len(reference_hook_set),
                 "bridge_hooks": len(bridge_hooks),
                 "extra_hooks": len(extra_hooks) if extra_hooks else 0,
             },
@@ -108,7 +109,7 @@ def benchmark_hook_registry(
 def benchmark_forward_hooks(
     bridge: TransformerBridge,
     test_text: str,
-    reference_model: Optional[HookedTransformer] = None,
+    reference_activations: Optional[Dict[str, torch.Tensor]] = None,
     tolerance: float = 0.5,
     prepend_bos: Optional[bool] = None,
 ) -> BenchmarkResult:
@@ -116,8 +117,9 @@ def benchmark_forward_hooks(
 
     Args:
         bridge: TransformerBridge model to test
-        test_text: Input text for testing
-        reference_model: Optional HookedTransformer for comparison
+        test_text: Input text for testing (must match the snapshot's prompt)
+        reference_activations: Optional reference activations keyed by hook name
+            (e.g. a golden fixture snapshot). Fire-only self-check if None.
         tolerance: Tolerance for activation matching (fraction of mismatches allowed)
         prepend_bos: Whether to prepend BOS token. If None, uses model default.
 
@@ -126,11 +128,10 @@ def benchmark_forward_hooks(
     """
     try:
         bridge_activations: Dict[str, torch.Tensor] = {}
-        reference_activations: Dict[str, torch.Tensor] = {}
 
-        # Get all hook names
-        if reference_model is not None:
-            hook_names = list(reference_model.hook_dict.keys())
+        # Reference hook names come from the snapshot when provided
+        if reference_activations is not None:
+            hook_names = list(reference_activations.keys())
         else:
             hook_names = list(bridge.hook_dict.keys())
 
@@ -160,7 +161,7 @@ def benchmark_forward_hooks(
         registered_hooks = {name for name, _ in bridge_hook_points}
         hooks_that_didnt_fire = registered_hooks - set(bridge_activations.keys())
 
-        if reference_model is None:
+        if reference_activations is None:
             # No reference - just verify activations were captured
             if hooks_that_didnt_fire:
                 return BenchmarkResult(
@@ -180,25 +181,6 @@ def benchmark_forward_hooks(
                 message=f"Bridge captured {len(bridge_activations)} forward hook activations",
                 details={"activation_count": len(bridge_activations)},
             )
-
-        # Register hooks on reference model
-        reference_hook_points: list[HookPoint] = []
-        for hook_name in hook_names:
-            if hook_name in reference_model.hook_dict:
-                hook_point = reference_model.hook_dict[hook_name]
-                hook_point.add_hook(make_capture_hook(reference_activations, hook_name))
-                reference_hook_points.append(hook_point)
-
-        # Run reference forward pass
-        with torch.no_grad():
-            if prepend_bos is not None:
-                _ = reference_model(test_text, prepend_bos=prepend_bos)
-            else:
-                _ = reference_model(test_text)
-
-        # Clean up reference hooks
-        for hook_point in reference_hook_points:
-            hook_point.remove_hooks()
 
         # CRITICAL CHECK: Bridge must have all hooks that reference has.
         # Filter out hooks that bridge models inherently don't have.
@@ -457,15 +439,16 @@ def benchmark_gated_hooks_fire(
 def benchmark_critical_forward_hooks(
     bridge: TransformerBridge,
     test_text: str,
-    reference_model: Optional[HookedTransformer] = None,
+    reference_activations: Optional[Dict[str, torch.Tensor]] = None,
     tolerance: float = 2e-2,
 ) -> BenchmarkResult:
     """Benchmark critical forward hooks commonly used in interpretability research.
 
     Args:
         bridge: TransformerBridge model to test
-        test_text: Input text for testing
-        reference_model: Optional HookedTransformer reference model
+        test_text: Input text for testing (must match the snapshot's prompt)
+        reference_activations: Optional reference activations keyed by hook name
+            (e.g. a golden fixture snapshot). Capture-only self-check if None.
         tolerance: Tolerance for activation comparison
 
     Returns:
@@ -516,7 +499,7 @@ def benchmark_critical_forward_hooks(
         for hook_point in bridge_hook_points:
             hook_point.remove_hooks()
 
-        if reference_model is None:
+        if reference_activations is None:
             # No reference - just verify activations were captured
             captured_count = len(bridge_activations)
             return BenchmarkResult(
@@ -525,24 +508,6 @@ def benchmark_critical_forward_hooks(
                 message=f"Bridge captured {captured_count}/{len(critical_hooks)} critical hooks",
                 details={"captured": captured_count, "expected": len(critical_hooks)},
             )
-
-        # Compare with reference model
-        reference_activations: Dict[str, torch.Tensor] = {}
-
-        reference_hook_points: list[HookPoint] = []
-        for hook_name in critical_hooks:
-            if hook_name in reference_model.hook_dict:
-                hook_point = reference_model.hook_dict[hook_name]
-                hook_point.add_hook(make_capture_hook(reference_activations, hook_name))
-                reference_hook_points.append(hook_point)
-
-        # Run reference forward pass
-        with torch.no_grad():
-            _ = reference_model(test_text)
-
-        # Clean up hooks
-        for hook_point in reference_hook_points:
-            hook_point.remove_hooks()
 
         # Compare activations — categorize by presence
         bridge_missing = []  # Hooks in reference but not in bridge (BAD)
@@ -652,15 +617,16 @@ def benchmark_critical_forward_hooks(
 def benchmark_hook_functionality(
     bridge: TransformerBridge,
     test_text: str,
-    reference_model: Optional[HookedTransformer] = None,
+    reference_effect: Optional[float] = None,
     atol: float = 2e-3,
 ) -> BenchmarkResult:
     """Benchmark hook system functionality through ablation effects.
 
     Args:
         bridge: TransformerBridge model to test
-        test_text: Input text for testing
-        reference_model: Optional HookedTransformer reference model
+        test_text: Input text for testing (must match the reference's prompt)
+        reference_effect: Optional reference ablation loss-delta (e.g. from a
+            golden fixture). Effect-only self-check if None.
         atol: Absolute tolerance for effect comparison
 
     Returns:
@@ -696,13 +662,30 @@ def benchmark_hook_functionality(
             return activation
 
         # Test bridge
-        bridge_original = bridge(test_text, return_type="loss")
+        # Encoder-decoder bridges name their stacks; a bare blocks.* hook would
+        # silently no-op and make the ablation vacuous.
+        ablation_target = next(
+            (
+                name
+                for name in (
+                    "blocks.0.attn.hook_v",
+                    "encoder_blocks.0.attn.hook_v",
+                    "decoder_blocks.0.attn.hook_v",
+                )
+                if name in bridge.hook_dict
+            ),
+            "blocks.0.attn.hook_v",
+        )
+        bridge_original = bridge_self_target_loss(bridge, test_text)
         bridge_ablated = bridge.run_with_hooks(
-            test_text, return_type="loss", fwd_hooks=[("blocks.0.attn.hook_v", ablation_hook)]
+            test_text,
+            return_type="loss",
+            labels=bridge.to_tokens(test_text),
+            fwd_hooks=[(ablation_target, ablation_hook)],
         )
         bridge_effect = bridge_ablated - bridge_original
 
-        if reference_model is None:
+        if reference_effect is None:
             # No reference - just verify ablation had an effect
             effect_magnitude = abs(bridge_effect.item())
             if effect_magnitude < 1e-6:
@@ -720,16 +703,9 @@ def benchmark_hook_functionality(
                 details={"effect": effect_magnitude},
             )
 
-        # Test reference model
-        reference_original = reference_model(test_text, return_type="loss")
-        reference_ablated = reference_model.run_with_hooks(
-            test_text, return_type="loss", fwd_hooks=[("blocks.0.attn.hook_v", ablation_hook)]
-        )
-        reference_effect = reference_ablated - reference_original
-
         return compare_scalars(
             bridge_effect.item(),
-            reference_effect.item(),
+            reference_effect,
             atol=atol,
             name="hook_functionality",
         )

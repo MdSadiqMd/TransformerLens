@@ -76,7 +76,6 @@ def _setup_eager_attention_hook_wrapper() -> None:
     if _EAGER_ATTENTION_WRAPPED:
         return
 
-    # Store the original function
     _ORIGINAL_EAGER_ATTENTION_FORWARD = gemma2_module.eager_attention_forward
 
     def hooked_eager_attention_forward(
@@ -110,7 +109,6 @@ def _setup_eager_attention_hook_wrapper() -> None:
             if hasattr(bridge, "hook_rot_k"):
                 key = bridge.hook_rot_k(key)
 
-        # Call the original function
         assert _ORIGINAL_EAGER_ATTENTION_FORWARD is not None
         return _ORIGINAL_EAGER_ATTENTION_FORWARD(
             module, query, key, value, attention_mask, **kwargs
@@ -345,22 +343,7 @@ class PositionEmbeddingsAttentionBridge(PositionEmbeddingHooksMixin, AttentionBr
         position_embeddings = kwargs.pop("position_embeddings", None)
         attention_mask = kwargs.pop("attention_mask", None)
 
-        # Apply input hook
         hidden_states = self.hook_in(hidden_states)
-
-        # Match dtype of HF module. Skip non-fp params: quantized weights (bnb
-        # uint8/int8, GPTQ/AWQ int32, HQQ, torchao) are stored in integer dtypes
-        # and dequantized internally during matmul. The compute dtype must come
-        # from a fp parameter; casting fp inputs to an integer storage dtype
-        # destroys precision.
-        target_dtype = None
-        for p in hf_attn.parameters():
-            if not p.dtype.is_floating_point:
-                continue
-            target_dtype = p.dtype
-            break
-        if target_dtype is not None and hidden_states.is_floating_point():
-            hidden_states = hidden_states.to(dtype=target_dtype)
 
         input_shape = hidden_states.shape[:-1]
         head_dim = hf_attn.head_dim
@@ -622,6 +605,7 @@ class PositionEmbeddingsAttentionBridge(PositionEmbeddingHooksMixin, AttentionBr
             attn_weights = torch.nn.functional.softmax(attn_scores, dim=-1, dtype=torch.float32).to(
                 query_states.dtype
             )
+        attn_weights = self._scrub_compatibility_pattern_nans(attn_weights)
 
         # --- Dropout ---
         dropout_rate = getattr(hf_attn, "attention_dropout", 0.0)

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 from copy import deepcopy
-from typing import Any
+from typing import Any, Optional
 
 import einops
 import numpy as np
@@ -27,7 +27,7 @@ def tokenize_and_concatenate(
     max_length: int = 1024,
     column_name: str = "text",
     add_bos_token: bool = True,
-    num_proc: int = 10,
+    num_proc: Optional[int] = 10,
     set_format: bool = True,
 ) -> Dataset | IterableDataset:
     """Tokenize each document, join with token-level EOS between docs, and reshape into ``(batch, sequence_length)`` rows.
@@ -44,7 +44,9 @@ def tokenize_and_concatenate(
         max_length (int, optional): The length of the context window of the sequence. Defaults to 1024.
         column_name (str, optional): The name of the text column in the dataset. Defaults to 'text'.
         add_bos_token (bool, optional): Whether to prepend ``bos_token_id`` to each output row. Defaults to True.
-        num_proc (int, optional): Number of processes for parallel tokenization. Ignored when ``streaming=True``. Defaults to 10.
+        num_proc (int, optional): Number of processes for parallel tokenization. ``None``
+            runs in-process -- datasets forks a dill-pickling pool for any int, 1 included.
+            Ignored when ``streaming=True``. Defaults to 10.
         set_format (bool, optional): If True, calls ``set_format(type="torch")`` on the result. Set False
             for ``IterableDataset`` (which doesn't support format setting); wrap the output in
             ``(torch.LongTensor(ex["tokens"]) for ex in tokenized_dataset)`` instead. Defaults to True.
@@ -182,18 +184,27 @@ def get_tokenizer_with_bos(tokenizer: PreTrainedTokenizerBase) -> PreTrainedToke
 
 
 def get_input_with_manually_prepended_bos(
-    bos_token: str, input: str | list[str]
+    bos_token: Optional[str], input: str | list[str]
 ) -> str | list[str]:
     """
     Manually prepends the bos token to the input.
 
     Args:
-        bos_token (str): The BOS token to prepend.
+        bos_token (Optional[str]): The BOS token to prepend, or None for a tokenizer
+            that has none (e.g. BERT, T5).
         input (str | list[str]): The input to prepend the bos token to.
 
     Returns:
-        str | list[str]: The input with the bos token manually prepended.
+        str | list[str]: The input with the bos token manually prepended, or unchanged
+            when there is no BOS token to prepend.
     """
+    if bos_token is None:
+        # Nothing to prepend. Callers reach this when prepend_bos is asked for and
+        # cfg.tokenizer_prepends_bos is False — correctly so for a BOS-less tokenizer,
+        # since detect_tokenizer_bos_eos() requires a bos_token_id. Concatenating
+        # would raise a TypeError naming neither the tokenizer nor the flag.
+        return input
+
     if isinstance(input, str):
         input = bos_token + input
     else:
@@ -202,7 +213,9 @@ def get_input_with_manually_prepended_bos(
 
 
 def get_tokens_with_bos_removed(
-    tokenizer: PreTrainedTokenizerBase, tokens: torch.Tensor
+    tokenizer: PreTrainedTokenizerBase,
+    tokens: torch.Tensor,
+    padding_side: str | None = None,
 ) -> torch.Tensor:
     """
     Removes the bos token from the beginning of each sequence in `tokens`.
@@ -211,11 +224,23 @@ def get_tokens_with_bos_removed(
     Args:
         tokenizer (PreTrainedTokenizerBase): The tokenizer used to tokenize the input.
         tokens (torch.Tensor): The tokenized input.
+        padding_side: The side used to pad ``tokens``. Defaults to the tokenizer setting.
 
     Returns:
         torch.Tensor: The tokenized input with the bos token removed.
     """
-    if tokenizer.padding_side == "right":
+    if tokenizer.bos_token_id is None:
+        # Nothing to remove (#1628). Callers reach this when cfg.tokenizer_prepends_bos
+        # says the tokenizer prepends a BOS but the tokenizer has none — a stale
+        # flag, since detect_tokenizer_bos_eos() requires a bos_token_id. Trusting
+        # it here would drop a real first token under right padding ([CLS] for a
+        # BERT tokenizer), and compare tokens against None under left padding.
+        return tokens
+
+    if padding_side is None:
+        padding_side = tokenizer.padding_side
+
+    if padding_side == "right":
         return tokens[..., 1:]
 
     else:
@@ -234,7 +259,10 @@ def get_tokens_with_bos_removed(
 
 
 def get_attention_mask(
-    tokenizer: PreTrainedTokenizerBase, tokens: torch.Tensor, prepend_bos: bool
+    tokenizer: PreTrainedTokenizerBase,
+    tokens: torch.Tensor,
+    prepend_bos: bool,
+    padding_side: str | None = None,
 ) -> torch.Tensor:
     """
     Computes the attention mask for the tokenized input.
@@ -246,18 +274,21 @@ def get_attention_mask(
         tokenizer (PreTrainedTokenizerBase): The tokenizer used for tokenization.
         tokens (torch.Tensor): The tokenized input.
         prepend_bos (bool): If True, a BOS token is prepended to the input.
+        padding_side: The side used to pad ``tokens``. Defaults to the tokenizer setting.
 
     Returns:
         torch.Tensor: The attention mask for the input.
     """
 
-    # Initialize the attention mask with ones (indicating all tokens should be attended to)
+    # Default to attending every token; pad positions are zeroed below.
     attention_mask = torch.ones_like(tokens)
     if tokenizer is None:
         return attention_mask
+    if padding_side is None:
+        padding_side = tokenizer.padding_side
     is_not_pad_token = tokens.ne(tokenizer.pad_token_id)
 
-    if tokenizer.padding_side == "right":
+    if padding_side == "right":
         # Zero-out the rightmost trailing pad tokens
         is_trailing_pad = get_cumsum_along_dim(is_not_pad_token, -1, reverse=True) == 0
         attention_mask[is_trailing_pad] = 0
